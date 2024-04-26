@@ -1,0 +1,33 @@
+{   
+    "DATA_DIR": "data/", 
+    "NUM_CLASSES": 4, 
+    "IMAGE_SIZE": 128, 
+    "IMAGE_CHANNEL_COUNT": 1,
+    "MAX_GT_INSTANCES": 20, 
+    "USE_MINI_MASK": false, 
+    "OUTPUT_DIR": "data/results/",
+
+    "MODE": "inference",
+
+    "BACKBONE": "resnet50", 
+    "TOP_DOWN_PYRAMID_SIZE": 128, 
+    "PRE_NMS_LIMIT": 1000, 
+    "POST_NMS_ROIS_TRAINING": 250, 
+    "POST_NMS_ROIS_INFERENCE": 40,
+
+    "TRAIN_ROIS_PER_IMAGE": 40, 
+    "ROI_POSITIVE_RATIO": 0.33, 
+    "FPN_CLASSIF_FC_LAYERS_SIZE": 128,
+    "DETECTION_MAX_INSTANCES": 20,
+    "DETECTION_MIN_CONFIDENCE": 0.5,
+
+    "GPU_COUNT": 1, 
+    "IMAGES_PER_GPU": 1,
+    "LEARNING_LAYERS": "all", 
+    "OPTIMIZER": {"name": "SGD", "parameters": {"learning_rate": 1e-2, "momentum": 0.9}},
+    "WEIGHT_DIR": "./weights/scp_mrcnn/",
+    "EPOCHS": 20, 
+    "FROM_EPOCH": 0,
+    "RPN_WEIGHTS": "weights/scp_rpn/epoch_020.h5",
+    "HEAD_WEIGHTS": "weights/scp_heads/epoch_020.h5"
+}
