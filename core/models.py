@@ -1,20 +1,3 @@
-"""
-3D Mask R-CNN
-
-Based on the 2D implementation by Matterport, Inc,
-the update to TensorFlow 2 written by Ahmed Gad and
-the world4jason fork that replaced the old data generator
-for the DataGenerator from keras.utils.Sequence.
-
-https://github.com/matterport/Mask_RCNN
-https://github.com/ahmedfgad/Mask-RCNN-TF2
-https://github.com/matterport/Mask_RCNN/pull/1611/files
-
-This 3D implementation was written by Gabriel David (PhD).
-
-Licensed under the MIT License (see Matterport_LICENSE for details)
-"""
-
 import os
 import re
 import math
@@ -1441,15 +1424,16 @@ class SaveWeightsCallback(keras.callbacks.Callback):
 
 
 class RPNEvaluationCallback(keras.callbacks.Callback):
-    def __init__(self, model, config, train_dataset, test_dataset):
+    def __init__(self, model, config, train_dataset, test_dataset, check_boxes=False):
         super(RPNEvaluationCallback, self).__init__()
         self.model = model
         self.config = config
         self.train_dataset = train_dataset
         self.test_dataset = test_dataset
+        self.check_boxes = check_boxes
 
     def on_epoch_end(self, epoch, logs=None):
-        rpn_evaluation(self.model, self.config, ["TRAIN SUBSET", "TEST SUBSET"], [self.train_dataset, self.test_dataset])
+        rpn_evaluation(self.model, self.config, ["TRAIN SUBSET", "TEST SUBSET"], [self.train_dataset, self.test_dataset], self.check_boxes)
 
 
 class HeadEvaluationCallback(keras.callbacks.Callback):
@@ -1844,6 +1828,15 @@ class RPN():
             
             # Save dataset dataframe
             example_dataframe.to_csv(f"{base_path}datasets/{set_type}.csv", index=None)
+
+    def evaluate(self):
+        
+        # Load RPN_WEIGHTS
+        self.keras_model.load_weights(self.config.RPN_WEIGHTS, by_name=True)
+
+        evaluation = RPNEvaluationCallback(self.keras_model, self.config, self.train_dataset, self.test_dataset, check_boxes=True)
+
+        evaluation.on_epoch_end(self.epoch)
 
 
 class HEAD():
@@ -2526,8 +2519,7 @@ class MaskRCNN():
         result_dir = self.config.OUTPUT_DIR
         os.makedirs(result_dir, exist_ok=True)
 
-        # for i in tqdm(range(len(self.test_dataset.image_info))):
-        for i in tqdm(range(20)):
+        for i in tqdm(range(len(self.test_dataset.image_info))):
             # Load inputs
             name, inputs = data_generator.get_input_prediction(i)
 

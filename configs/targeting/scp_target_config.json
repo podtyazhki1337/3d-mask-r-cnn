@@ -11,7 +11,7 @@
     "MODE": "targeting",
 
     "BACKBONE": "resnet50", 
-    "TOP_DOWN_PYRAMID_SIZE": 128,
+    "TOP_DOWN_PYRAMID_SIZE": 256,
     "PRE_NMS_LIMIT": 1000, 
     "POST_NMS_ROIS_TRAINING": 40, 
     "POST_NMS_ROIS_INFERENCE": 40,

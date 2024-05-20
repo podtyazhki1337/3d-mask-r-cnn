@@ -26,3 +26,7 @@ if __name__ == '__main__':
     
     # Training loop (one epoch -> save weights -> quick train monitoring -> one epoch -> ...)
     rpn.train()
+
+    # Next line allows to check predicted boxes (so called rpn_rois) and ground truth boxes
+    # Note: must add RPN_WEIGHTS in scp_rpn_config.json
+    # rpn.evaluate()

@@ -10,7 +10,7 @@
 
     "MODE": "training",
 
-    "TOP_DOWN_PYRAMID_SIZE": 128,
+    "TOP_DOWN_PYRAMID_SIZE": 256,
     
     "TRAIN_ROIS_PER_IMAGE": 40,
     "ROI_POSITIVE_RATIO": 0.33, 

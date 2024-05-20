@@ -1,20 +1,3 @@
-"""
-3D Mask R-CNN
-
-Based on the 2D implementation by Matterport, Inc,
-the update to TensorFlow 2 written by Ahmed Gad and
-the world4jason fork that replaced the old data generator
-for the DataGenerator from keras.utils.Sequence.
-
-https://github.com/matterport/Mask_RCNN
-https://github.com/ahmedfgad/Mask-RCNN-TF2
-https://github.com/matterport/Mask_RCNN/pull/1611/files
-
-This 3D implementation was written by Gabriel David (PhD).
-
-Licensed under the MIT License (see Matterport_LICENSE for details)
-"""
-
 import logging
 import random
 import numpy as np
@@ -728,7 +711,7 @@ def compute_ap(gt_boxes, gt_class_ids, gt_masks,
     return mAP, precision_score, recall_score, ious
 
 
-def rpn_evaluation(model, config, subsets, datasets):
+def rpn_evaluation(model, config, subsets, datasets, check_boxes):
     max_object_nb = 2 * config.MAX_GT_INSTANCES
     for subset, dataset in zip(subsets, datasets):
         print(subset)
@@ -737,6 +720,7 @@ def rpn_evaluation(model, config, subsets, datasets):
         detection_scores = []
         class_loss = []
         bbox_loss = []
+        checked = 0
         for k in range(config.EVALUATION_STEPS):
             inputs, _ = generator.__getitem__(k)
             _, _, _, batch_rpn_rois, rpn_class_loss, rpn_bbox_loss = model.predict(inputs)
@@ -745,7 +729,7 @@ def rpn_evaluation(model, config, subsets, datasets):
                 _, boxes, _ = generator.load_image_gt(k * config.BATCH_SIZE + m)
                 
                 rpn_rois = denorm_boxes(batch_rpn_rois[m, :max_object_nb], config.IMAGE_SHAPE[:3])
-                # print(rpn_rois.shape, boxes.shape)
+
                 overlaps = compute_overlaps(boxes, rpn_rois)
                 
                 roi_association = -1 * np.ones(boxes.shape[0]).astype(np.uint8)
@@ -766,6 +750,10 @@ def rpn_evaluation(model, config, subsets, datasets):
                 positive_rois = rpn_rois[roi_association]
                 positive_boxes = boxes[box_association]
 
+                if check_boxes and checked < 10:
+                    print("Pred:", positive_rois)
+                    print("GT:", positive_boxes)
+                    checked += 1
 
                 bbox_errors.append(np.mean(np.abs(positive_rois - positive_boxes)))
                 detection_scores.append(100 * positive_rois.shape[0] / boxes.shape[0])

@@ -1,5 +1,3 @@
-#!/usr/bin/env python
-
 import os
 import numpy as np
 import random
@@ -40,14 +38,14 @@ def create_data(inputs):
     img = np.random.rand(*image_shape)*0.1
     seg = np.zeros(image_shape).astype('uint8')
     nbCenter = random.randint(3, num_max_objects)
-    # print('proceesing {} {} with {} cells '.format(out_dir, six, nbCenter))
+    # print('processing {} {} with {} cells '.format(out_dir, six, nbCenter))
     f = open(out_dir+'classes_and_boxes/'+str(six+1).zfill(6)+'.dat', 'w')
     masks = np.zeros((*image_shape, nbCenter))
     n = 0
     trial = 0
     while n < nbCenter:
         object_choice = random.choice([[getSphere, spheres, 1], [getCube, cubes, 2], [getPyramid, pyramids, 3]])
-        # object_choice = [getSphere, spheres, 1]
+
         getObject = object_choice[0]
         objects = object_choice[1]
 
@@ -74,7 +72,7 @@ def create_data(inputs):
         if len(isOther) == 1 and isOther[0] == 0:  # Evertything is OK
             seg[coords[0], coords[1], coords[2]] = n+1
             img[coords[0], coords[1], coords[2]] += 0.15
-            masks[..., n] = np.where(seg == n, 1 ,0).astype(np.uint8)
+            masks[coords[0], coords[1], coords[2], n] = np.uint8(1)
             horizontal_indicies = np.where(np.any(np.any(masks[..., n], axis=0), axis=1))[0]
             vertical_indicies = np.where(np.any(np.any(masks[..., n], axis=1), axis=1))[0]
             profound_indicies = np.where(np.any(np.any(masks[..., n], axis=0), axis=0))[0]
