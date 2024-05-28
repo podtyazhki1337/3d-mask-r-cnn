@@ -5,3 +5,4 @@
 /.config
 /.keras
 /.nv
+/__pycache__
