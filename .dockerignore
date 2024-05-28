@@ -1,0 +1,7 @@
+./data
+./.vscode
+./example
+./.cache
+./.config
+./.keras
+./.nv

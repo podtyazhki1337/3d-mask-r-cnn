@@ -20,6 +20,5 @@
 
     "IMAGES_PER_GPU": 1, 
     "GPU_COUNT": 1, 
-    "RPN_WEIGHTS": "weights/scp_rpn/epoch_020.h5",
-    "FROM_EPOCH": 20
+    "RPN_WEIGHTS": "weights/scp_rpn/epoch_020.h5"
 }

@@ -4,42 +4,32 @@ import argparse
 from core.config import load_config
 from core.models import RPN, HEAD, MaskRCNN
 
-# Comment the following line to debug TF or libcuda issues
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-
 
 if __name__ == '__main__':
-    
+
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--task', 
                         type=str,
                         required=True,
-                        choices=['RPN_TRAINING', 'RPN_EVALUATION', 'TARGET_GENERATION' 'HEAD_TRAINING', 'MRCNN_EVALUATION'],
-                        help='Task to operate: "RPN_TRAINING", "RPN_EVALUATION", "TARGET_GENERATION", "HEAD_TRAINING" ou "MRCNN_EVALUATION"')
+                        choices=['RPN_TRAINING', 'RPN_EVALUATION', 'TARGET_GENERATION', 'HEAD_TRAINING', 'MRCNN_EVALUATION'],
+                        help='Task to operate.')
     
     parser.add_argument('--config_path', 
                         type=str, 
                         required=True,
                         help="Path to config file.")
     
-    parser.add_argument('--gpus', 
-                        type=str, 
-                        default='0',
-                        help="Choice of GPU. Default is '0'.")
-    
     parser.add_argument('--summary', 
-                        action='store_true')
+                        action='store_true',
+                        help='Print model summary and config.')
     
     args = parser.parse_args()
 
     # Load training config
     toy_config = load_config(args.config_path)
-
-    # Assign gpus
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
-
-    
+   
+    print("prout")
     if args.task == "RPN_TRAINING":
 
         # Initiate model
@@ -48,7 +38,7 @@ if __name__ == '__main__':
         # Training loop (one epoch -> save weights -> quick train monitoring -> one epoch -> ...)
         rpn.train()
     
-    elif args.task == "RPN_EVALUATE":
+    elif args.task == "RPN_EVALUATION":
 
         # Initiate model
         rpn = RPN(toy_config, show_summary=args.summary)
@@ -73,8 +63,8 @@ if __name__ == '__main__':
         # Training loop (one epoch -> save weights -> quick train monitoring -> one epoch -> ...)
         head.train()
     
-    elif args.task == "MRCNN_EVALUATE":
-
+    elif args.task == "MRCNN_EVALUATION":
+        print("caca")
         # Initiate model
         mrcnn = MaskRCNN(toy_config, show_summary=args.summary)
 

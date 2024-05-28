@@ -352,7 +352,7 @@ class ProposalLayer(KE.Layer):
         # Non-max suppression
         def nms(boxes, scores):
 
-            indices = custom_op.nms3d_module.non_max_suppression3d(
+            indices = custom_op.non_max_suppression_3d(
                 boxes, 
                 scores, 
                 self.proposal_count,
@@ -537,11 +537,8 @@ class PyramidROIAlign(KE.Layer):
             # interpolating only a single value at each bin center (without
             # pooling) is nearly as effective."
             #
-            # Here we use the simplified approach of a single value per bin,
-            # which is how it's done in tf.crop_and_resize()
-            # Result: [batch * num_boxes, pool_height, pool_width, channels]
-            pooled.append(custom_op.car3d_module.crop_and_resize3d(
-                feature_maps[i], level_boxes, box_indices, self.pool_shape))
+            # Result: [batch * num_boxes, pool_height, pool_width, pool_depth, channels]
+            pooled.append(custom_op.crop_and_resize_3d(feature_maps[i], level_boxes, box_indices, self.pool_shape))
 
         # Pack pooled features into one tensor
         pooled = tf.concat(pooled, axis=0)
@@ -732,8 +729,7 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes, gt_masks, train_r
         boxes = tf.concat([y1, x1, z1, y2, x2, z2], 1)
 
     box_ids = tf.range(0, tf.shape(roi_masks)[0])
-    masks = custom_op.car3d_module.crop_and_resize3d(tf.cast(roi_masks, tf.float32), boxes,
-                                     box_ids, mask_shape)
+    masks = custom_op.crop_and_resize_3d(tf.cast(roi_masks, tf.float32), boxes, box_ids, mask_shape)
     
     # Remove the extra dimension from masks.
     masks = tf.squeeze(masks, axis=4)
@@ -1081,7 +1077,7 @@ def refine_detections_graph(rois, probs, deltas, window, bbox_std_dev,
         ixs = tf.where(tf.equal(pre_nms_class_ids, class_id))[:, 0]
 
         # Apply NMS
-        class_keep = custom_op.nms3d_module.non_max_suppression3d(
+        class_keep = custom_op.non_max_suppression_3d(
             tf.gather(pre_nms_rois, ixs),
             tf.gather(pre_nms_scores, ixs),
             max_output_size=detection_max_instances,
