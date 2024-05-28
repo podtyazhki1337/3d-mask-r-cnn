@@ -25,7 +25,7 @@
     "IMAGES_PER_GPU": 1,
     "LEARNING_LAYERS": "all", 
     "OPTIMIZER": {"name": "SGD", "parameters": {"learning_rate": 1e-2, "momentum": 0.9}},
-    "WEIGHT_DIR": "./weights/scp_mrcnn/",
+    "WEIGHT_DIR": "weights/scp_mrcnn/",
     "EPOCHS": 20, 
     "FROM_EPOCH": 0,
     "RPN_WEIGHTS": "weights/scp_rpn/epoch_020.h5",

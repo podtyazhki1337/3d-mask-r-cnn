@@ -12,7 +12,7 @@ if __name__ == '__main__':
     parser.add_argument('--task', 
                         type=str,
                         required=True,
-                        choices=['RPN_TRAINING', 'RPN_EVALUATION', 'TARGET_GENERATION', 'HEAD_TRAINING', 'MRCNN_EVALUATION'],
+                        choices=['RPN_TRAINING', 'RPN_EVALUATION', 'TARGET_GENERATION', 'HEAD_TRAINING', 'MRCNN_EVALUATION', 'MRCNN_TRAINING'],
                         help='Task to operate.')
     
     parser.add_argument('--config_path', 
@@ -28,8 +28,7 @@ if __name__ == '__main__':
 
     # Load training config
     toy_config = load_config(args.config_path)
-   
-    print("prout")
+
     if args.task == "RPN_TRAINING":
 
         # Initiate model
@@ -64,7 +63,7 @@ if __name__ == '__main__':
         head.train()
     
     elif args.task == "MRCNN_EVALUATION":
-        print("caca")
+        
         # Initiate model
         mrcnn = MaskRCNN(toy_config, show_summary=args.summary)
 

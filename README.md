@@ -17,7 +17,9 @@ Representations of pair ground truth instance segmentation and input image:
 <p align="center">
     <img src="example/segmentation.gif" alt="Instance segmentation"><img src="example/input_image.gif" alt="Input image">
 </p>
+
 Clone this repository and access cloned directory with:
+
 ```
 git clone https://github.com/gdavid57/3d-mask-r-cnn.git
 cd 3d-mask-r-cnn
