@@ -1,4 +1,4 @@
-# 3D Mask R-CNN
+<h1 align="center"> 3D Mask R-CNN </h1>
 
 Based on the [2D implementation](https://github.com/matterport/Mask_RCNN) by Matterport, Inc, [this update](https://github.com/ahmedfgad/Mask-RCNN-TF2) and [this fork](https://github.com/matterport/Mask_RCNN/pull/1611/files).
 
@@ -14,8 +14,9 @@ This section aims to reproduce the results of the paper mentioned above on the t
 
 Representations of pair ground truth instance segmentation and input image:
 
-![Instance segmentation](example/segmentation.gif)![Image](example/input_image.gif)
-
+<p align="center">
+    <img src="example/segmentation.gif" alt="Instance segmentation"><img src="example/input_image.gif" alt="Input image">
+</p>
 Clone this repository and access cloned directory with:
 ```
 git clone https://github.com/gdavid57/3d-mask-r-cnn.git
