@@ -2235,7 +2235,7 @@ class MaskRCNN():
                 self.config.TRAIN_ROIS_PER_IMAGE,
                 self.config.ROI_POSITIVE_RATIO,
                 self.config.BBOX_STD_DEV,
-                self.config.USE_MINI_MAKS,
+                self.config.USE_MINI_MASK,
                 self.config.MASK_SHAPE,
                 self.config.IMAGES_PER_GPU,
                 name="proposal_targets"
@@ -2515,7 +2515,7 @@ class MaskRCNN():
         result_dir = self.config.OUTPUT_DIR
         os.makedirs(result_dir, exist_ok=True)
 
-        for i in tqdm(range(len(self.test_dataset.image_info))):
+        for i in range(len(self.test_dataset.image_info)):
             # Load inputs
             name, inputs = data_generator.get_input_prediction(i)
 
@@ -2536,6 +2536,9 @@ class MaskRCNN():
 
             # Write results in dataframe
             result_dataframe.loc[len(result_dataframe.index)] = [name, gt_masks.shape[-1], map50, precision50, recall50, np.mean(ious)]
+
+            # Print 
+            print(f"{i+1}/{len(self.test_dataset.image_info)}", " Example name:", name, ", Nb of inst.:", gt_masks.shape[-1], ", mAP: ", map50, ", Precision: ", precision50, ", Recall: ", recall50, ", Mean IoU: ", np.mean(ious))
 
         # Save dataframe
         result_dataframe.to_csv(f"{result_dir}report.csv", index=None)

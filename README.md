@@ -30,14 +30,14 @@ cd 3d-mask-r-cnn
 Execute the following command to generate the Toy Dataset example:
 
 ```
-docker run -it --volume $PWD:/workspace gdavid57/3d-mask-r-cnn python -m generate_data --train_dir "./data/" --nb_thread 1 --nb_train_images 10000 --image_size 128
+docker run -it --volume $PWD:/workspace gdavid57/3d-mask-r-cnn python -m generate_data --train_dir "./data/" --thread_nb 1 --train_image_nb 10000 --image_size 128
 ```
 
 The parameters are explained as follows:
 
 + --train_dir: This argument specifies the directory where the data for training will be stored. The default value is './data/'.
-+ --nb_thread: This argument specifies the number of threads you want to run for your experiment. The default value is 1.
-+ --n_train_images: This argument specifies the number of training images you want to generate for your experiment. The default value is 10000.
++ --thread_nb: This argument specifies the number of threads you want to run for your experiment. The default value is 1.
++ --train_image_nb: This argument specifies the number of training images you want to generate for your experiment. The default value is 10000.
 + --image_size: This argument specifies the size of the images to be generated for your experiment. The default value is 128.
 
 Default generation will produce ~18Go of data.

@@ -137,7 +137,7 @@ def generate_data(info, start, end):
         create_data(info[i])
 
 
-def generate_experiment(nb_train_images, image_size, train_dir, nb_thread):
+def generate_experiment(train_image_nb, image_size, train_dir, thread_nb):
 
     os.makedirs(f"{train_dir}", exist_ok=True)
     os.makedirs(f"{train_dir}classes_and_boxes/", exist_ok=True)
@@ -148,12 +148,12 @@ def generate_experiment(nb_train_images, image_size, train_dir, nb_thread):
     image_shape = (image_size, image_size, image_size)
 
     info = []
-    info += [[image_shape, train_dir, six] for six in range(nb_train_images)]
+    info += [[image_shape, train_dir, six] for six in range(train_image_nb)]
 
-    batch_size = int(nb_train_images / nb_thread)
+    batch_size = int(train_image_nb / thread_nb)
     threads = list()
     print('starting creating {} images'.format(len(info)))
-    for i in range(nb_thread):
+    for i in range(thread_nb):
         x = threading.Thread(target=generate_data, args=(info, i * batch_size, (i +1) * batch_size))
         threads.append(x)
         x.start()
@@ -161,10 +161,10 @@ def generate_experiment(nb_train_images, image_size, train_dir, nb_thread):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--train_dir', type=str, default='./data/')
-    parser.add_argument('--nb_thread', type=int, default=1)
-    parser.add_argument('--nb_train_images', type=int, default=10000)
+    parser.add_argument('--thread_nb', type=int, default=1)
+    parser.add_argument('--train_image_nb', type=int, default=10000)
     parser.add_argument('--image_size', type=int, default=128)
 
     args = parser.parse_args()
 
-    generate_experiment(args.nb_train_images, args.image_size, args.train_dir, args.nb_thread)
+    generate_experiment(args.train_image_nb, args.image_size, args.train_dir, args.thread_nb)
