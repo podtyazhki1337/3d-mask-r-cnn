@@ -8,6 +8,8 @@ This repository is linked to the paper:
 
 We adopt a Docker approach to simplify the distribution and reproduction of our work. Running this 3D Mask R-CNN without our image is possible but requires to install TensorFlow sources and to compile the 3D Non Max Suppression and 3D Crop And Reisze custom operations by hand.
 
+The implementation for the Phallusia mammillata dataset can be found in the [morphogenesis branch.](https://github.com/gdavid57/3d-mask-r-cnn/tree/morphogenesis)
+
 # Toy Dataset
 
 This section aims to reproduce the results of the paper mentioned above on the toy dataset. Please follow the default commands below.
@@ -111,42 +113,9 @@ where
 By default, the predicted instance segmentation are saved under *data/results/* and results such as mAP, precision and recall are gathered in the *report.csv* in the same folder.
 
 
-<!-- ## Appendix 1: Compare prediction and ground truth instance segmentation
-
-
-
-## Appendix 2: Mask R-CNN training
-
-The whole Mask R-CNN is trainable as an end-to-end network with the Python script:
-
-```
-python mrcnn_training.py --config_path "configs/mrcnn/scp_mrcnn_config.json" --gpus "0" --summary True
-```
-
-where
-
-+ --config: whole Mask R-CNN config. See *scp_mrcnn_config.json* or *core/config.py* for more details.
-+ --gpus: GPUs to use for training. "0" or "1" to use only one gpu, "0,1" for two gpus for instance.
-+ --summary: if True, display the Mask R-CNN keras model summary, number of examples in train and test datasets, as well as the training config.
-
-## Appendix 3: Mask R-CNN prediction
-
-The whole Mask R-CNN is trainable as an end-to-end network with the Python script:
-
-```
-python mrcnn_training.py --config_path "configs/mrcnn/scp_mrcnn_config.json" --gpus "0" --summary True
-```
-
-where
-
-+ --config: whole Mask R-CNN config. See *scp_mrcnn_config.json* or *core/config.py* for more details.
-+ --gpus: GPUs to use for training. "0" or "1" to use only one gpu, "0,1" for two gpus for instance.
-+ --summary: if True, display the Mask R-CNN keras model summary, number of examples in train and test datasets, as well as the training config. -->
-
-
 # Troubleshooting
 
-+ Docker must be installed. See [here](https://docs.docker.com/engine/install/) for Docker installation. Don't forget to follow the post-installation instructions.
++ A recent version of Docker must be installed. See [here](https://docs.docker.com/engine/install/) for Docker installation. Follow the post-installation instructions to add current user to docker group.
 
 + In case of custom op error, please compile the 3D Non Max Suppression and 3D Crop And Resize on your own computer following [this tutorial](https://github.com/gdavid57/3d-nms-car-custom-op). The generated wheel archive should then be placed in core/custom_op/ of this repo, and the image must be rebuilt with
 
