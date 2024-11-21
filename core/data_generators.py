@@ -447,8 +447,8 @@ class ToyDataset(Dataset):
         # ann_mean = the mean of the origin 3D image pixel values [type: float]
         # ann_std = the standard deviation of the origin 3D image pixel values
         '''
-        self.add_class("dataset", 1, "sphere")
-        self.add_class("dataset", 2, "cube")
+        self.add_class("dataset", 1, "ellipsoid")
+        self.add_class("dataset", 2, "cuboid")
         self.add_class("dataset", 3, "pyramid")
 
         if is_train:
@@ -507,8 +507,8 @@ class ToyHeadDataset(Dataset):
         # ann_mean = the mean of the origin 3D image pixel values [type: float]
         # ann_std = the standard deviation of the origin 3D image pixel values
         '''
-        self.add_class("dataset", 1, "sphere")
-        self.add_class("dataset", 2, "cube")
+        self.add_class("dataset", 1, "ellipsoid")
+        self.add_class("dataset", 2, "cuboid")
         self.add_class("dataset", 3, "pyramid")
 
         if is_train:
