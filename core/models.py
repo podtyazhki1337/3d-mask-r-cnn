@@ -2,6 +2,7 @@ import os
 import re
 import math
 import multiprocessing
+import platform
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
@@ -16,7 +17,11 @@ import keras.layers as KL
 import keras.engine as KE
 import keras.models as KM
 
-import core.custom_op.custom_op as custom_op
+if platform.processor() == 'ppc64le':
+    import core.custom_op.ppc64le_custom_op as custom_op
+else:
+    import core.custom_op.custom_op as custom_op
+
 from core.utils import rpn_evaluation, head_evaluation, compute_ap
 from core.data_generators import RPNGenerator, HeadGenerator, MrcnnGenerator, ToyDataset, ToyHeadDataset
 
