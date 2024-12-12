@@ -64,6 +64,7 @@ def create_data(inputs):
         {
             "image": [],
             "label": [],
+            "class": [],
             "noise": [],
             "y1": [],
             "x1": [],
@@ -121,7 +122,7 @@ def create_data(inputs):
             n += 1
             f.write('{}\t{}\t{}\t{}\t{}\t{}\t{}\n'.format(object_choice[1], y1, x1, z1, y2+1, x2+1, z2+1))
             ryx, ryz, rxz = get_aspect_ratios(delta_y, delta_x, delta_z)
-            img_df.loc[len(img_df.index)] = [name, n+1, object_noise, y1, x1, z1, y2+1, x2+1, z2+1, ryx, ryz, rxz]
+            img_df.loc[len(img_df.index)] = [name, n+1, object_choice[1], object_noise, y1, x1, z1, y2+1, x2+1, z2+1, ryx, ryz, rxz]
         else:
             trial += 1
 

@@ -68,3 +68,10 @@ if __name__ == '__main__':
 
         # Inference and evaluation over test dataset
         mrcnn.evaluate()
+
+    elif args.task == "MRCNN_TRAINING":
+
+        mrcnn = MaskRCNN(toy_config, show_summary=args.summary)
+
+        mrcnn.train()
+

@@ -2401,37 +2401,6 @@ class MaskRCNN():
 
         # Compile
         self.keras_model.compile(optimizer=optimizer, loss=[None] * len(self.keras_model.outputs))
-
-    def set_trainable(self, layer_regex, keras_model=None, indent=0, verbose=1):
-        """
-        Sets model layers as trainable if their names match
-        the given regular expression.
-        """
-
-        keras_model = keras_model or self.keras_model
-
-        # In multi-GPU training, we wrap the model. Get layers
-        # of the inner model because they have the weights.
-        layers = self.keras_model.inner_model.layers if hasattr(self.keras_model, "inner_model") \
-            else self.keras_model.layers
-
-        for layer in layers:
-            # Is the layer a model?
-            if layer.__class__.__name__ == 'Model':
-                print("In model: ", layer.name)
-                self.set_trainable(
-                    layer_regex, keras_model=layer, indent=indent + 4)
-                continue
-
-            if not layer.weights:
-                continue
-            # Is it trainable?
-            trainable = bool(re.fullmatch(layer_regex, layer.name))
-            # Update layer. If layer is a container, update inner layer.
-            if layer.__class__.__name__ == 'TimeDistributed':
-                layer.layer.trainable = trainable
-            else:
-                layer.trainable = trainable
                 
     def train(self):
 
@@ -2442,22 +2411,6 @@ class MaskRCNN():
 
         # Callback for saving weights
         save_weights = SaveWeightsCallback(self.config.WEIGHT_DIR)
-
-        # Set only self.config.LEARNING_LAYERS trainable
-        layers = self.config.LEARNING_LAYERS
-        layer_regex = {
-            # rpn
-            "rpn": r"(conv1)|(bn_conv1)|(res2.*)|(bn2.*)|(res3.*)|(bn3.*)|(res4.*)|(bn4.*)|(res5.*)|(bn5.*)|(rpn\_.*)|(fpn\_.*)",
-            # all layers but the backbone
-            "heads": r"(mrcnn\_.*)",
-            # All layers
-            "all": ".*",
-        }
-
-        if layers in layer_regex.keys():
-            layers = layer_regex[layers]
-
-        self.set_trainable(layers)
 
         # Model compilation
         self.compile()
@@ -2523,7 +2476,7 @@ class MaskRCNN():
         for i in range(len(self.test_dataset.image_info)):
             # Load inputs
             name, inputs = data_generator.get_input_prediction(i)
-
+            name = name.split(".")[0]
             # Load ground truth
             _, _, gt_boxes, gt_class_ids, gt_masks = data_generator.load_image_gt(i)
 
@@ -2533,8 +2486,11 @@ class MaskRCNN():
             # Unmold prediction
             pd_boxes, pd_scores, pd_class_ids, pd_masks, pd_segs = self.unmold_detections(detections[0], mrcnn_mask[0])
 
+            # Save predicted classes and boxes
+            self.save_classes_and_boxes(pd_class_ids, pd_boxes, name)
+
             # Save predicted instance segmentation
-            imsave(f"{self.config.OUTPUT_DIR}{name}", pd_segs.astype(np.uint8), check_contrast=False)
+            imsave(f"{self.config.OUTPUT_DIR}{name}.tiff", pd_segs.astype(np.uint8), check_contrast=False)
 
             # Evaluate
             map50, precision50, recall50, ious = compute_ap(gt_boxes, gt_class_ids, gt_masks, pd_boxes, pd_class_ids, pd_scores, pd_masks, iou_threshold=0.5)
@@ -2550,6 +2506,29 @@ class MaskRCNN():
 
         # Print mean results
         print(result_dataframe.mean())
+
+    def save_classes_and_boxes(self, pd_class_ids, pd_boxes, name):
+        
+        cab_df = pd.DataFrame(
+            {
+                "class": [],
+                "y1" : [],
+                "x1": [],
+                "z1": [],
+                "y2": [],
+                "x2": [],
+                "z2": [],
+            }
+        )
+        
+        for i in range(pd_boxes.shape[0]):
+            
+            y1, x1, z1, y2, x2, z2 = pd_boxes[i]
+            class_id = pd_class_ids[i]
+            
+            cab_df.loc[len(cab_df)] = [class_id, y1, x1, z1, y2, x2, z2]
+            
+        cab_df.to_csv(f"{self.config.OUTPUT_DIR}{name}.csv")
 
     def unmold_detections(self, detections, mrcnn_mask):
         """

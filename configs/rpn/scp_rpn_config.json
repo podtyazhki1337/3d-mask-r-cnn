@@ -11,15 +11,15 @@
 
     "BACKBONE": "resnet50", 
     "TOP_DOWN_PYRAMID_SIZE": 256,
-    "RPN_TRAIN_ANCHORS_PER_IMAGE": 150, 
-    "PRE_NMS_LIMIT": 1000, 
-    "POST_NMS_ROIS_TRAINING": 250, 
-    "POST_NMS_ROIS_INFERENCE": 250, 
+    "RPN_TRAIN_ANCHORS_PER_IMAGE": 1500, 
+    "PRE_NMS_LIMIT": 2000, 
+    "POST_NMS_ROIS_TRAINING": 500, 
+    "POST_NMS_ROIS_INFERENCE": 500, 
 
     "IMAGES_PER_GPU": 1, 
     "GPU_COUNT": 1, 
     "LOSS_WEIGHTS": {"rpn_class_loss": 1.0, "rpn_bbox_loss": 1.0}, 
-    "OPTIMIZER": {"name": "SGD", "parameters": {"learning_rate": 0.01, "momentum": 0.9}},
+    "OPTIMIZER": {"name": "SGD", "parameters": {"learning_rate": 1e-3, "momentum": 0.9}},
     "WEIGHT_DIR": "weights/scp_rpn/",
     "EPOCHS": 20,
     "FROM_EPOCH": 0
