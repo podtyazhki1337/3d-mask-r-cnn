@@ -12,7 +12,7 @@ The implementation for the Phallusia mammillata dataset can be found in the [mor
 
 # Toy Dataset
 
-This section aims to reproduce the results of the paper mentioned above on the toy dataset. Please follow the default commands below.
+This section aims to reproduce the results of the paper mentioned above on the toy dataset. Note that the input image signal was enhaced for the sake of visualization. Please follow the default commands below.
 
 Representations of pair ground truth instance segmentation and input image:
 
