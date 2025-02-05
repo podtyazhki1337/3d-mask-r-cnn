@@ -6,7 +6,7 @@ This 3D implementation was written by Gabriel David (LIRMM, Montpellier, France)
 
 This repository is linked to the paper:
 
-G. David and E. Faure, End-to-end 3D instance segmentation of synthetic data and embryo microscopy images with a 3D Mask R-CNN, Front. Bioinform., 27 January 2025, Volume 4 - 2024 | [DOI link](https://doi.org/10.3389/fbinf.2024.1497539)
+**G. David and E. Faure, End-to-end 3D instance segmentation of synthetic data and embryo microscopy images with a 3D Mask R-CNN, Front. Bioinform., 27 January 2025, Volume 4 - 2024 | [DOI link](https://doi.org/10.3389/fbinf.2024.1497539)**
 
 We adopt a Docker approach to simplify the distribution and reproduction of our work. Running this 3D Mask R-CNN without our image is possible but requires to install TensorFlow sources and to compile the 3D Non Max Suppression and 3D Crop And Reisze custom operations by hand.
 
