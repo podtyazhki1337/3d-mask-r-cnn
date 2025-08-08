@@ -7,7 +7,7 @@ from sklearn.model_selection import train_test_split
 def split_data(data_dir, test_size):
 
     cab_dir = f"{data_dir}classes_and_boxes/"
-    seg_dir = f"{data_dir}seg/"
+    seg_dir = f"{data_dir}images/"
     images_dir = f"{data_dir}images/"
     masks_dir = f"{data_dir}masks/"
 

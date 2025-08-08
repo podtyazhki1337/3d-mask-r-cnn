@@ -73,6 +73,10 @@ def compute_overlaps(boxes1, boxes2):
 
     For better performance, pass the largest set first and the smaller second.
     """
+    if boxes1.size == 0 or boxes2.size == 0:
+        # Вернём корректную «пустую» матрицу пересечений,
+        # чтобы остальной код не падал.
+        return np.zeros((boxes1.shape[0], boxes2.shape[0]), dtype=np.float16)
     # Areas of anchors and GT boxes
     area1 = (boxes1[:, 3] - boxes1[:, 0]) * (boxes1[:, 4] - boxes1[:, 1]) * (boxes1[:, 5] - boxes1[:, 2])
     area2 = (boxes2[:, 3] - boxes2[:, 0]) * (boxes2[:, 4] - boxes2[:, 1]) * (boxes2[:, 5] - boxes2[:, 2])
@@ -90,7 +94,10 @@ def compute_overlaps_masks(masks1, masks2):
     """Computes IoU overlaps between two sets of masks.
     masks1, masks2: [Height, Width, Depth, instances]
     """
-
+    if masks1 is None:
+        masks1 = np.zeros((0, 0, 0), dtype=bool)
+    if masks2 is None:
+        masks2 = np.zeros((0, 0, 0), dtype=bool)
     # If either set of masks is empty return empty result
     if masks1.shape[-1] == 0 or masks2.shape[-1] == 0:
         return np.zeros((masks1.shape[-1], masks2.shape[-1]))
@@ -729,13 +736,15 @@ def rpn_evaluation(model, config, subsets, datasets, check_boxes):
                 _, boxes, _ = generator.load_image_gt(k * config.BATCH_SIZE + m)
                 
                 rpn_rois = denorm_boxes(batch_rpn_rois[m, :max_object_nb], config.IMAGE_SHAPE[:3])
-
+                if gt_boxes.shape[0] == 0 or rpn_rois.shape[0] == 0:
+                    continue
                 overlaps = compute_overlaps(boxes, rpn_rois)
                 
                 roi_association = -1 * np.ones(boxes.shape[0]).astype(np.uint8)
                 box_association = -1 * np.ones(rpn_rois.shape[0]).astype(np.uint8)
                 for j in range(rpn_rois.shape[0]):
                     roi_overlaps = overlaps[:, j]
+
                     argmax = np.argmax(roi_overlaps)
                     if roi_association[argmax] == -1:
                         if roi_overlaps[argmax] > 0.5:

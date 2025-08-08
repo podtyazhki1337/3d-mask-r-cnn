@@ -1,26 +1,26 @@
 {   
-    "DATA_DIR": "data/scp_target/",
-    "NUM_CLASSES": 4,
-    "IMAGE_SIZE": 128, 
-    "IMAGE_CHANNEL_COUNT": 1, 
+    "DATA_DIR": "/NAS/mmaiurov/Datasets/rat_neurons_patches64/scp_target/",
+    "NUM_CLASSES": 2,
+    "IMAGE_SIZE": 64,
+    "IMAGE_CHANNEL_COUNT": 1,
     "MAX_GT_INSTANCES": 20,
     "USE_MINI_MASK": false,
     "TARGET_RATIO": 0.2,
-    "EVALUATION_STEPS": 100,
+    "EVALUATION_STEPS": 44,
 
     "MODE": "training",
 
     "TOP_DOWN_PYRAMID_SIZE": 256,
     
-    "TRAIN_ROIS_PER_IMAGE": 40,
+    "TRAIN_ROIS_PER_IMAGE": 16,
     "ROI_POSITIVE_RATIO": 0.33, 
     "FPN_CLASSIF_FC_LAYERS_SIZE": 512,
 
-    "IMAGES_PER_GPU": 1, 
+    "IMAGES_PER_GPU": 12,
     "GPU_COUNT": 1,
     "LOSS_WEIGHTS": {"mrcnn_class_loss": 1.0, "mrcnn_bbox_loss": 1.0, "mrcnn_mask_loss": 1.0}, 
     "OPTIMIZER": {"name": "SGD", "parameters": {"learning_rate": 1e-3, "momentum": 0.9}},
     "WEIGHT_DIR": "./weights/scp_heads/",
-    "EPOCHS": 20,
+    "EPOCHS": 40,
     "FROM_EPOCH": 0
 }

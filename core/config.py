@@ -19,7 +19,8 @@ class Config(object):
         # Data
         DATA_DIR = "data/",
         NUM_CLASSES = 2,
-        IMAGE_SIZE = 256, 
+        IMAGE_SIZE = 256,
+        IMAGE_DEPTH = 12,
         IMAGE_CHANNEL_COUNT = 1,
         MAX_GT_INSTANCES = 771,
         TARGET_RATIO = 0.2,
@@ -37,11 +38,11 @@ class Config(object):
         BACKBONE = "resnet50",
         BACKBONE_STRIDES = [4, 8, 16, 32, 64],
         TOP_DOWN_PYRAMID_SIZE = 256,
-        RPN_ANCHOR_SCALES = (32, 64, 128, 256, 512),
+        RPN_ANCHOR_SCALES = (4, 8, 12, 16, 20),
         RPN_ANCHOR_RATIOS = [1], 
         RPN_ANCHOR_STRIDE = 1,
         RPN_TRAIN_ANCHORS_PER_IMAGE = 256,
-        RPN_NMS_THRESHOLD = 0.7, 
+        RPN_NMS_THRESHOLD = 0.4,
         PRE_NMS_LIMIT = 6000,
         POST_NMS_ROIS_TRAINING = 2000, 
         POST_NMS_ROIS_INFERENCE = 1000,
@@ -89,12 +90,12 @@ class Config(object):
 
         # Input image size
         self.IMAGE_SIZE = IMAGE_SIZE
-
+        self.IMAGE_DEPTH = IMAGE_DEPTH
         # Number of color channels per image.
         self.IMAGE_CHANNEL_COUNT = IMAGE_CHANNEL_COUNT
 
         # Input image shape
-        self.IMAGE_SHAPE = np.array([self.IMAGE_SIZE, self.IMAGE_SIZE, self.IMAGE_SIZE, self.IMAGE_CHANNEL_COUNT])
+        self.IMAGE_SHAPE = np.array([self.IMAGE_SIZE, self.IMAGE_SIZE, self.IMAGE_DEPTH, self.IMAGE_CHANNEL_COUNT])
 
         # Maximum number of ground truth instances to use in one image
         self.MAX_GT_INSTANCES = MAX_GT_INSTANCES

@@ -116,7 +116,8 @@ def identity_block(input_tensor, kernel_size, filters, stage, block,
 
 
 def conv_block(input_tensor, kernel_size, filters, stage, block,
-               strides=(2, 2, 2), use_bias=True, train_bn=True):
+               #strides=(2, 2, 2), use_bias=True, train_bn=True):
+               strides=(2, 2, 1), use_bias=True, train_bn=True):
     """conv_block is the block that has a conv layer at shortcut
     # Arguments
         input_tensor: input tensor
@@ -168,7 +169,8 @@ def resnet_graph(input_image, architecture, stage5=False, train_bn=True):
 
     # Stage 1
     x = KL.ZeroPadding3D((3, 3, 3))(input_image)
-    x = KL.Conv3D(64, (7, 7, 7), strides=(2, 2, 2), name='conv1', use_bias=True)(x)
+    # x = KL.Conv3D(64, (7, 7, 7), strides=(2, 2, 2), name='conv1', use_bias=True)(x)
+    x = KL.Conv3D(64, (7, 7, 7), strides=(2, 2, 1), name='conv1', use_bias=True)(x)
     x = BatchNorm(name='bn_conv1')(x, training=train_bn)
     x = KL.Activation('relu')(x)
     C1 = x = KL.MaxPooling3D((3, 3, 3), strides=(2, 2, 2), padding="same")(x)
@@ -1245,7 +1247,11 @@ def rpn_class_loss_graph(rpn_match, rpn_class_logits):
     loss = K.switch(tf.size(loss) > 0, K.mean(loss), tf.constant(0.0))
 
     return loss
-
+def smooth_l1(y_true, y_pred):
+    """classic Smooth-L1 = Huber(δ=1)"""
+    diff = K.abs(y_true - y_pred)
+    less_than_one = K.cast(K.less(diff, 1.0), "float32")
+    return less_than_one * 0.5 * diff**2 + (1 - less_than_one) * (diff - 0.5)
 
 def rpn_bbox_loss_graph(images_per_gpu, target_bbox, rpn_match, rpn_bbox):
     """
@@ -1268,17 +1274,27 @@ def rpn_bbox_loss_graph(images_per_gpu, target_bbox, rpn_match, rpn_bbox):
     rpn_match = K.squeeze(rpn_match, -1)
     indices = tf.where(K.equal(rpn_match, 1))
 
+    def no_positive():        return tf.constant(0., dtype=tf.float32)
+
+    def positive_present():
+        rpn_bbox_pos   = tf.gather_nd(rpn_bbox,   indices)
+        target_bbox_pos = tf.gather_nd(target_bbox, indices)
+        loss = K.mean(smooth_l1(target_bbox_pos, rpn_bbox_pos))
+        return loss
+
+    return tf.cond(tf.equal(tf.size(indices), 0),
+                   no_positive, positive_present)
     # Pick bbox deltas that contribute to the loss
-    rpn_bbox = tf.gather_nd(rpn_bbox, indices)
-
-    # Trim target bounding box deltas to the same length as rpn_bbox.
-    batch_counts = K.sum(K.cast(K.equal(rpn_match, 1), tf.int32), axis=1)
-    target_bbox = batch_pack_graph(target_bbox, batch_counts, images_per_gpu)
-
-    loss = smooth_l1_loss(target_bbox, rpn_bbox)
-    loss = K.switch(tf.size(loss) > 0, K.mean(loss), tf.constant(0.0))
-
-    return loss
+    # rpn_bbox = tf.gather_nd(rpn_bbox, indices)
+    #
+    # # Trim target bounding box deltas to the same length as rpn_bbox.
+    # batch_counts = K.sum(K.cast(K.equal(rpn_match, 1), tf.int32), axis=1)
+    # target_bbox = batch_pack_graph(target_bbox, batch_counts, images_per_gpu)
+    #
+    # loss = smooth_l1_loss(target_bbox, rpn_bbox)
+    # loss = K.switch(tf.size(loss) > 0, K.mean(loss), tf.constant(0.0))
+    #
+    # return loss
 
 
 def mrcnn_class_loss_graph(target_class_ids, pred_class_logits,
@@ -1488,11 +1504,11 @@ class RPN():
         train_dataset = ToyDataset()
         train_dataset.load_dataset(data_dir=self.config.DATA_DIR)
         train_dataset.prepare()
-
+        train_dataset.filter_positive()
         test_dataset = ToyDataset()
         test_dataset.load_dataset(data_dir=self.config.DATA_DIR, is_train=False)
         test_dataset.prepare()
-
+        test_dataset.filter_positive()
         return train_dataset, test_dataset
 
     def print_summary(self):
@@ -1513,12 +1529,15 @@ class RPN():
         """
 
         # Image size must be dividable by 2 multiple times
+        # h, w, d = self.config.IMAGE_SHAPE[:3]
+        # if h / 2 ** 6 != int(h / 2 ** 6) or w / 2 ** 6 != int(w / 2 ** 6) or d / 2 ** 6 != int(d / 2 ** 6):
+        #     raise Exception("Image size must be dividable by 2 at least 6 times "
+        #                     "to avoid fractions when downscaling and upscaling."
+        #                     "For example, use 256, 320, 384, 448, 512, ... etc. ")
         h, w, d = self.config.IMAGE_SHAPE[:3]
-        if h / 2 ** 6 != int(h / 2 ** 6) or w / 2 ** 6 != int(w / 2 ** 6) or d / 2 ** 6 != int(d / 2 ** 6):
-            raise Exception("Image size must be dividable by 2 at least 6 times "
-                            "to avoid fractions when downscaling and upscaling."
-                            "For example, use 256, 320, 384, 448, 512, ... etc. ")
-
+        # Важна только кратность 64 по XY (для FPN).  Глубину больше не проверяем.
+        if (h % 64) or (w % 64):
+            raise ValueError("IMAGE_SHAPE height & width must be multiples of 64")
         # Inputs
         input_image = KL.Input(shape=self.config.IMAGE_SHAPE, name="input_image")
         input_image_meta = KL.Input(shape=[self.config.IMAGE_META_SIZE],name="input_image_meta")
@@ -1534,16 +1553,19 @@ class RPN():
         P5 = KL.Conv3D(self.config.TOP_DOWN_PYRAMID_SIZE, (1, 1, 1), name='fpn_c5p5')(C5)
 
         P4 = KL.Add(name="fpn_p4add")([
-            KL.UpSampling3D(size=(2, 2, 2), name="fpn_p5upsampled")(P5),
+            # KL.UpSampling3D(size=(2, 2, 2), name="fpn_p5upsampled")(P5),
+            KL.UpSampling3D(size=(2, 2, 1), name="fpn_p5upsampled")(P5),
             KL.Conv3D(self.config.TOP_DOWN_PYRAMID_SIZE, (1, 1, 1), name='fpn_c4p4')(C4)
         ])
 
         P3 = KL.Add(name="fpn_p3add")([
-            KL.UpSampling3D(size=(2, 2, 2), name="fpn_p4upsampled")(P4),
+            # KL.UpSampling3D(size=(2, 2, 2), name="fpn_p4upsampled")(P4),
+            KL.UpSampling3D(size=(2, 2, 1), name="fpn_p4upsampled")(P4),
             KL.Conv3D(self.config.TOP_DOWN_PYRAMID_SIZE, (1, 1, 1), name='fpn_c3p3')(C3)
         ])
         P2 = KL.Add(name="fpn_p2add")([
-            KL.UpSampling3D(size=(2, 2, 2), name="fpn_p3upsampled")(P3),
+            # KL.UpSampling3D(size=(2, 2, 2), name="fpn_p3upsampled")(P3),
+            KL.UpSampling3D(size=(2, 2, 1), name="fpn_p3upsampled")(P3),
             KL.Conv3D(self.config.TOP_DOWN_PYRAMID_SIZE, (1, 1, 1), name='fpn_c2p2')(C2)
         ])
         
@@ -1872,11 +1894,11 @@ class HEAD():
         train_dataset = ToyHeadDataset()
         train_dataset.load_dataset(data_dir=self.config.DATA_DIR)
         train_dataset.prepare()
-
+        train_dataset.filter_positive()
         test_dataset = ToyHeadDataset()
         test_dataset.load_dataset(data_dir=self.config.DATA_DIR, is_train=False)
         test_dataset.prepare()
-
+        test_dataset.filter_positive()
         return train_dataset, test_dataset
 
     def print_summary(self):
@@ -2099,7 +2121,7 @@ class MaskRCNN():
         train_dataset = ToyDataset()
         train_dataset.load_dataset(data_dir=self.config.DATA_DIR)
         train_dataset.prepare()
-
+        train_dataset.filter_positive()
         test_dataset = ToyDataset()
         test_dataset.load_dataset(data_dir=self.config.DATA_DIR, is_train=False)
         test_dataset.prepare()
@@ -2126,12 +2148,14 @@ class MaskRCNN():
         assert self.config.MODE in ['training', 'inference']
         
         # Image size must be dividable by 2 multiple times
+        # h, w, d = self.config.IMAGE_SHAPE[:3]
+        # if h / 2 ** 6 != int(h / 2 ** 6) or w / 2 ** 6 != int(w / 2 ** 6) or d / 2 ** 6 != int(d / 2 ** 6):
+        #     raise Exception("Image size must be dividable by 2 at least 6 times "
+        #                     "to avoid fractions when downscaling and upscaling."
+        #                     "For example, use 256, 320, 384, 448, 512, ... etc. ")
         h, w, d = self.config.IMAGE_SHAPE[:3]
-        if h / 2 ** 6 != int(h / 2 ** 6) or w / 2 ** 6 != int(w / 2 ** 6) or d / 2 ** 6 != int(d / 2 ** 6):
-            raise Exception("Image size must be dividable by 2 at least 6 times "
-                            "to avoid fractions when downscaling and upscaling."
-                            "For example, use 256, 320, 384, 448, 512, ... etc. ")
-
+        if (h % 64) or (w % 64):
+            raise ValueError("IMAGE_SHAPE height & width must be multiples of 64")
         # Inputs
         input_image = KL.Input(shape=[*self.config.IMAGE_SHAPE], name="input_image")
         input_image_meta = KL.Input(shape=[self.config.IMAGE_META_SIZE], name="input_image_meta")

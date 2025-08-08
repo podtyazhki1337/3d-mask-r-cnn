@@ -1,26 +1,26 @@
 {   
-    "DATA_DIR": "data/", 
-    "NUM_CLASSES": 4, 
-    "IMAGE_SIZE": 128, 
+    "DATA_DIR": "/NAS/mmaiurov/Datasets/rat_neurons_patches64/",
+    "NUM_CLASSES": 2,
+    "IMAGE_SIZE": 64,
     "IMAGE_CHANNEL_COUNT": 1,
     "MAX_GT_INSTANCES": 20, 
     "USE_MINI_MASK": false, 
-    "OUTPUT_DIR": "data/results/",
+    "OUTPUT_DIR": "/NAS/mmaiurov/Datasets/rat_neurons_patches64/results/",
 
     "MODE": "inference",
 
     "BACKBONE": "resnet50", 
     "TOP_DOWN_PYRAMID_SIZE": 256, 
-    "RPN_TRAIN_ANCHORS_PER_IMAGE": 1500, 
+    "RPN_TRAIN_ANCHORS_PER_IMAGE": 500,
     "PRE_NMS_LIMIT": 2000, 
-    "POST_NMS_ROIS_TRAINING": 500, 
-    "POST_NMS_ROIS_INFERENCE": 500,
+    "POST_NMS_ROIS_TRAINING": 300,
+    "POST_NMS_ROIS_INFERENCE": 300,
 
-    "TRAIN_ROIS_PER_IMAGE": 40, 
+    "TRAIN_ROIS_PER_IMAGE": 16,
     "ROI_POSITIVE_RATIO": 0.2, 
     "FPN_CLASSIF_FC_LAYERS_SIZE": 512,
     "DETECTION_MAX_INSTANCES": 40,
-    "DETECTION_MIN_CONFIDENCE": 0.95,
+    "DETECTION_MIN_CONFIDENCE": 0.4,
 
     "GPU_COUNT": 1, 
     "IMAGES_PER_GPU": 1,
@@ -29,6 +29,6 @@
     "WEIGHT_DIR": "weights/scp_mrcnn/",
     "EPOCHS": 20, 
     "FROM_EPOCH": 0,
-    "RPN_WEIGHTS": "weights/scp_rpn/epoch_020.h5",
-    "HEAD_WEIGHTS": "weights/scp_heads/epoch_020.h5"
+    "RPN_WEIGHTS": "weights/scp_rpn/epoch_012.h5",
+    "HEAD_WEIGHTS": "weights/scp_heads/epoch_010.h5"
 }

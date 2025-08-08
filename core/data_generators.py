@@ -26,9 +26,14 @@ class HeadGenerator(keras.utils.Sequence):
         return int(np.ceil(len(self.image_ids) / float(self.batch_size)))
 
     def __getitem__(self, idx):
-        return self.data_generator(self.image_ids[idx * self.batch_size:(idx + 1) * self.batch_size])
+        ids = self.image_ids[idx * self.batch_size:(idx + 1) * self.batch_size]
+        if len(ids) == 0:
+            raise IndexError("Empty batch requested — adjust evaluation steps or dataset size")
+        return self.data_generator(ids)
 
     def data_generator(self, image_ids):
+        if len(image_ids) == 0:
+            raise IndexError("Empty image_ids passed to data_generator.")
         image_id = image_ids[0]
 
         rois_aligned, mask_aligned, image_meta, target_class_ids, target_bbox, target_mask = self.load_image_gt(image_id)
@@ -68,15 +73,23 @@ class RPNGenerator(keras.utils.Sequence):
         backbone_shapes = compute_backbone_shapes(config, config.IMAGE_SHAPE)
         self.anchors = utils.generate_pyramid_anchors(config.RPN_ANCHOR_SCALES, config.RPN_ANCHOR_RATIOS, backbone_shapes,
                                    config.BACKBONE_STRIDES, config.RPN_ANCHOR_STRIDE)
-
+        self.anchor_nb = self.anchors.shape[0]
+        self.config.ANCHOR_NB = self.anchor_nb
     def __len__(self):
         return int(np.ceil(len(self.image_ids) / float(self.batch_size)))
 
     def __getitem__(self, idx):
-        return self.data_generator(self.image_ids[idx * self.batch_size:(idx + 1) * self.batch_size])
+        ids = self.image_ids[idx * self.batch_size:(idx + 1) * self.batch_size]
+        if len(ids) == 0:
+            raise IndexError("Empty batch requested — adjust evaluation steps or dataset size")
+        return self.data_generator(ids)
 
     def data_generator(self, image_ids):
         b = 0
+        max_resample = 10
+        if len(image_ids) == 0:
+            raise IndexError("Empty image_ids passed to data_generator.")
+        self.batch_size = len(image_ids)
         while b < self.batch_size:
             # Get GT bounding boxes and masks for image.
             image_id = image_ids[b]
@@ -112,11 +125,24 @@ class RPNGenerator(keras.utils.Sequence):
                     return inputs, outputs
             else:
                 image, boxes, class_ids = self.load_image_gt(image_id)
+                if boxes.shape[0] == 0:
+                    tries = 0
+                    while tries < max_resample:
+                        new_idx = np.random.randint(0, len(self.image_ids))
+                        new_id = self.image_ids[new_idx]
+                        _, new_boxes, _ = self.dataset.load_data(new_id, masks_needed=False)
+                        if new_boxes.shape[0] > 0:  # нашли «непустой» патч
+                            image_id = new_id
+                            image, boxes, class_ids = self.load_image_gt(image_id)
+                            break
+                        tries += 1
+
                 rpn_match, rpn_bbox = build_rpn_targets(self.anchors, class_ids, boxes, self.config)
+
 
                 # Init batch arrays
                 if b == 0:
-                    batch_rpn_match = np.zeros([self.batch_size, self.config.ANCHOR_NB, 1], dtype=rpn_match.dtype)
+                    batch_rpn_match = np.zeros([self.batch_size, self.anchor_nb, 1],dtype = rpn_match.dtype)
                     batch_rpn_bbox = np.zeros([self.batch_size, self.config.RPN_TRAIN_ANCHORS_PER_IMAGE, 6],
                                                 dtype=rpn_bbox.dtype)
                     batch_images = np.zeros((self.batch_size,) + image.shape, dtype=np.float32)
@@ -178,10 +204,14 @@ class MrcnnGenerator(keras.utils.Sequence):
         return int(np.ceil(len(self.image_ids) / float(self.batch_size)))
 
     def __getitem__(self, idx):
-        return self.data_generator(self.image_ids[idx * self.batch_size:(idx + 1) * self.batch_size])
+        ids = self.image_ids[idx * self.batch_size:(idx + 1) * self.batch_size]
+        if len(ids) == 0:
+            raise IndexError("Empty batch requested — adjust evaluation steps or dataset size")
+        return self.data_generator(ids)
 
     def data_generator(self, image_ids):
         b = 0
+        batch_size = len(image_ids)
         while b < self.batch_size:
             # Get GT bounding boxes and masks for image.
             image_id = image_ids[b]
@@ -348,6 +378,15 @@ class Dataset(object):
         self.class_info = [{"source": "", "id": 0, "name": "BG"}]
         self.source_class_ids = {}
 
+    def filter_positive(self):
+        """Оставляет только те image_ids, где есть хотя бы одна коробка."""
+        keep = []
+        for i in self._image_ids:
+            boxes, _, _ = self.load_data(i, masks_needed=False)
+            if boxes.shape[0] > 0:
+                keep.append(i)
+        self._image_ids = np.asarray(keep, dtype=np.int32)
+        print(f"[Dataset] positive patches: {len(keep)} / {self.num_images}")
     def add_class(self, source, class_id, class_name):
         assert "." not in source, "Source name cannot contain a dot"
         # Does the class exist already?
@@ -447,9 +486,8 @@ class ToyDataset(Dataset):
         # ann_mean = the mean of the origin 3D image pixel values [type: float]
         # ann_std = the standard deviation of the origin 3D image pixel values
         '''
-        self.add_class("dataset", 1, "ellipsoid")
-        self.add_class("dataset", 2, "cuboid")
-        self.add_class("dataset", 3, "pyramid")
+        self.add_class("dataset", 1, "neuron")
+
 
         if is_train:
             td = pd.read_csv(f"{data_dir}datasets/train.csv", header=[0])
@@ -470,26 +508,45 @@ class ToyDataset(Dataset):
                 self.add_image('dataset', image_id=i, path=img_path, seg_path=seg_path, cab_path=cab_path, m_path=m_path)
             print('Validation dataset is loaded.')
 
-    def load_image(self, image_id):
+    def load_image(self, image_id, z_slice=None):
         """Load the specified image and return a [H,W,3] Numpy array.
         """
         # Load image
         info = self.image_info[image_id]
         image = imread(info["path"])
+        image = np.transpose(image, (1, 2, 0))
         image = 2 * (image / 255) - 1
         image = image[..., np.newaxis]
+        # print(image.shape)
         return image
+
 
     def load_data(self, image_id, masks_needed=True):
         info = self.image_info[image_id]
-        cabs = np.loadtxt(info["cab_path"])
-        boxes = cabs[:, 1:]
-        class_ids = cabs[:, 0]
+        cabs = np.loadtxt(info["cab_path"], ndmin=2, dtype=np.int32)
+        if cabs.size:
+            if cabs.ndim == 1:
+                cabs = cabs.reshape((1, -1))
+            # z y x z y x  →  y x z y x z
+            boxes = cabs[:, [2, 3, 1, 5, 6, 4]]
+            class_ids = cabs[:, 0]
+        else:
+            boxes = np.zeros((0, 6), dtype=np.int32)
+            class_ids = np.zeros((0,), dtype=np.int32)
+
+            # --- маски --------------------------------------------
         if masks_needed:
-            masks = bz2.BZ2File(info["m_path"], 'rb')
-            masks = cPickle.load(masks)
+            if boxes.shape[0] == 0:
+                img = imread(info["path"])
+                H, W, D = img.shape[1], img.shape[2], img.shape[0]  # (Z,Y,X)→(Y,X,Z)
+                masks = np.zeros((H, W, D, 0), dtype=bool)
+            else:
+                with bz2.BZ2File(info["m_path"], 'rb') as f:
+                    m = cPickle.load(f)  # (Z, Y, X, N)
+                masks = np.transpose(m, (1, 2, 0, 3))  # → (Y, X, Z, N)
         else:
             masks = None
+
         return boxes, class_ids, masks
 
 
@@ -507,9 +564,8 @@ class ToyHeadDataset(Dataset):
         # ann_mean = the mean of the origin 3D image pixel values [type: float]
         # ann_std = the standard deviation of the origin 3D image pixel values
         '''
-        self.add_class("dataset", 1, "ellipsoid")
-        self.add_class("dataset", 2, "cuboid")
-        self.add_class("dataset", 3, "pyramid")
+        self.add_class("dataset", 1, "neuron")
+
 
         if is_train:
             td = pd.read_csv(f"{data_dir}datasets/train.csv", header=[0])
@@ -566,6 +622,10 @@ def build_rpn_targets(anchors, gt_class_ids, gt_boxes, config):
                1 = positive anchor, -1 = negative anchor, 0 = neutral
     rpn_bbox: [N, (dy, dx, dz, log(dh), log(dw), log(d))] Anchor bbox deltas.
     """
+    if gt_boxes.shape[0] == 0:
+        rpn_match = -np.ones([anchors.shape[0]], dtype=np.int32)  # все - «negative»
+        rpn_bbox = np.zeros((config.RPN_TRAIN_ANCHORS_PER_IMAGE, 6), dtype=np.float32)
+        return rpn_match, rpn_bbox
     # RPN Match: 1 = positive anchor, -1 = negative anchor, 0 = neutral
     rpn_match = np.zeros([anchors.shape[0]], dtype=np.int32)
     # RPN bounding boxes: [max anchors per image, (dy, dx, log(dh), log(dw))]
