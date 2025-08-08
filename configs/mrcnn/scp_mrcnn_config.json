@@ -2,6 +2,7 @@
     "DATA_DIR": "/NAS/mmaiurov/Datasets/rat_neurons_patches64/",
     "NUM_CLASSES": 2,
     "IMAGE_SIZE": 64,
+    "IMAGE_DEPTH": 12,
     "IMAGE_CHANNEL_COUNT": 1,
     "MAX_GT_INSTANCES": 20, 
     "USE_MINI_MASK": false, 
