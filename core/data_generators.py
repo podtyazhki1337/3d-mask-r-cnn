@@ -344,11 +344,18 @@ def compute_backbone_shapes(config, image_shape):
 
     # Currently supports ResNet only
     assert config.BACKBONE in ["resnet50", "resnet101"]
-    return np.array(
-        [[int(math.ceil(image_shape[0] / stride)),
-          int(math.ceil(image_shape[1] / stride)),
-          int(math.ceil(image_shape[2] / stride))]
-         for stride in config.BACKBONE_STRIDES])
+    shapes = []
+    for stride in config.BACKBONE_STRIDES:
+        if isinstance(stride, (int, np.integer)):
+            sy = sx = sz = int(stride)
+        else:
+            sy, sx, sz = stride
+        shapes.append([
+            int(math.ceil(image_shape[0] / sy)),
+            int(math.ceil(image_shape[1] / sx)),
+            int(math.ceil(image_shape[2] / sz)),
+        ])
+    return np.array(shapes)
 
 
 ############################################################
@@ -378,13 +385,44 @@ class Dataset(object):
         self.class_info = [{"source": "", "id": 0, "name": "BG"}]
         self.source_class_ids = {}
 
+    # def filter_positive(self):
+    #     """Оставляет только те image_ids, где есть хотя бы одна коробка."""
+    #     keep = []
+    #     for i in self._image_ids:
+    #         boxes, _, _ = self.load_data(i, masks_needed=False)
+    #         if boxes.shape[0] > 0:
+    #             keep.append(i)
+    #     self._image_ids = np.asarray(keep, dtype=np.int32)
+    #     print(f"[Dataset] positive patches: {len(keep)} / {self.num_images}")
     def filter_positive(self):
-        """Оставляет только те image_ids, где есть хотя бы одна коробка."""
+        """Оставляет только те image_ids, где есть хотя бы один позитивный объект.
+        Работает и для RPN-датасета (boxes), и для HEAD-датасета (target_class_ids>0)."""
         keep = []
         for i in self._image_ids:
-            boxes, _, _ = self.load_data(i, masks_needed=False)
-            if boxes.shape[0] > 0:
+            info = self.image_info[i]
+
+            if "cab_path" in info:
+                # Обычный RPN-датасет
+                boxes, _, _ = self.load_data(i, masks_needed=False)
+                has_pos = boxes is not None and boxes.shape[0] > 0
+
+            elif ("ra_path" in info) or ("tci_path" in info) or ("target_class_ids" in info):
+                # Датасет для HEAD после target generation
+                try:
+                    # ToyHeadDataset.load_data(image_id) -> (rois_aligned, mask_aligned, target_class_ids, target_bbox, target_mask)
+                    _, _, target_class_ids, _, _ = self.load_data(i)
+                except TypeError:
+                    # На случай, если где-то прокидывается masks_needed
+                    _, _, target_class_ids, _, _ = self.load_data(i, masks_needed=False)
+                has_pos = target_class_ids is not None and np.any(target_class_ids > 0)
+
+            else:
+                # Если тип записи неизвестен — не фильтруем
+                has_pos = True
+
+            if has_pos:
                 keep.append(i)
+
         self._image_ids = np.asarray(keep, dtype=np.int32)
         print(f"[Dataset] positive patches: {len(keep)} / {self.num_images}")
     def add_class(self, source, class_id, class_name):

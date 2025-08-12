@@ -36,13 +36,13 @@ class Config(object):
 
         # RPN
         BACKBONE = "resnet50",
-        BACKBONE_STRIDES = [4, 8, 16, 32, 64],
+        BACKBONE_STRIDES = [(4, 4, 2), (8, 8, 2), (16, 16, 2), (32, 32, 2), (64, 64, 4)],
         TOP_DOWN_PYRAMID_SIZE = 256,
-        RPN_ANCHOR_SCALES = (4, 8, 12, 16, 20),
-        RPN_ANCHOR_RATIOS = [1], 
+        RPN_ANCHOR_SCALES = (32, 64, 96, 128, 160),
+        RPN_ANCHOR_RATIOS = [0.125, 0.25, 0.5, 1.0],
         RPN_ANCHOR_STRIDE = 1,
-        RPN_TRAIN_ANCHORS_PER_IMAGE = 256,
-        RPN_NMS_THRESHOLD = 0.4,
+        RPN_TRAIN_ANCHORS_PER_IMAGE = 512,
+        RPN_NMS_THRESHOLD = 0.7,
         PRE_NMS_LIMIT = 6000,
         POST_NMS_ROIS_TRAINING = 2000, 
         POST_NMS_ROIS_INFERENCE = 1000,
@@ -173,12 +173,25 @@ class Config(object):
         self.POST_NMS_ROIS_INFERENCE = POST_NMS_ROIS_INFERENCE
 
         # Compute the number of anchors, useful in debugging
-        self.ANCHOR_NB = int( (self.IMAGE_SHAPE[0] / self.BACKBONE_STRIDES[0])**3 + \
-                            (self.IMAGE_SHAPE[0] / self.BACKBONE_STRIDES[1])**3 + \
-                            (self.IMAGE_SHAPE[0] / self.BACKBONE_STRIDES[2])**3 + \
-                            (self.IMAGE_SHAPE[0] / self.BACKBONE_STRIDES[3])**3 + \
-                            (self.IMAGE_SHAPE[0] / self.BACKBONE_STRIDES[4])**3 )
-        
+        # self.ANCHOR_NB = int( (self.IMAGE_SHAPE[0] / self.BACKBONE_STRIDES[0])**3 + \
+        #                     (self.IMAGE_SHAPE[0] / self.BACKBONE_STRIDES[1])**3 + \
+        #                     (self.IMAGE_SHAPE[0] / self.BACKBONE_STRIDES[2])**3 + \
+        #                     (self.IMAGE_SHAPE[0] / self.BACKBONE_STRIDES[3])**3 + \
+        #                     (self.IMAGE_SHAPE[0] / self.BACKBONE_STRIDES[4])**3 )
+        def _cells_per_level(stride):
+            if isinstance(stride, (int, np.integer)):
+                sy = sx = sz = int(stride)
+            else:
+                sy, sx, sz = stride
+            return (self.IMAGE_SHAPE[0] / sy) * (self.IMAGE_SHAPE[1] / sx) * (self.IMAGE_SHAPE[2] / sz)
+
+        self.ANCHOR_NB = int(
+            _cells_per_level(self.BACKBONE_STRIDES[0]) +
+            _cells_per_level(self.BACKBONE_STRIDES[1]) +
+            _cells_per_level(self.BACKBONE_STRIDES[2]) +
+            _cells_per_level(self.BACKBONE_STRIDES[3]) +
+            _cells_per_level(self.BACKBONE_STRIDES[4])
+        )
 
         ###########################################
         ###   Head parameters

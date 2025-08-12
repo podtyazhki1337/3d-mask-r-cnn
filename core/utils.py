@@ -9,6 +9,8 @@ import tensorflow as tf
 import warnings
 from distutils.version import LooseVersion
 
+
+
 from .data_generators import RPNGenerator, HeadGenerator
 
 
@@ -550,67 +552,51 @@ def unmold_mask(mask, bbox, image_shape):
 
 def generate_anchors(scales, ratios, shape, feature_stride, anchor_stride):
     """
-    scales: 1D array of anchor sizes in pixels. Example: [32, 64, 128]
-    ratios: 1D array of anchor ratios of width/height. Example: [0.5, 1, 2]
-    shape: [height, width] spatial shape of the feature map over which
-            to generate anchors.
-    feature_stride: Stride of the feature map relative to the image in pixels.
-    anchor_stride: Stride of anchors on the feature map. For example, if the
-        value is 2 then generate anchors for every other feature map pixel.
+    scales: базовые размеры по Y и X (в пикселях исходника)
+    ratios: коэффициенты глубины по Z (пример: [0.125, 0.25, 0.5, 1.0])
+    shape:  [height, width, depth] признаковой карты
+    feature_stride: int или (sy, sx, sz)
+    anchor_stride: int (шаг по сетке признаковой карты)
     """
-    # Get all combinations of scales and ratios
-    scales, ratios = np.meshgrid(np.array(scales), np.array(ratios))
-    scales = scales.flatten()
-    # ratios = ratios.flatten()
+    # stride по осям
+    if isinstance(feature_stride, (int, np.integer)):
+        sy = sx = sz = int(feature_stride)
+    else:
+        sy, sx, sz = feature_stride
 
-    # Enumerate heights and widths and depths from scales and ratios
-    heights = scales  # / np.sqrt(ratios)
-    widths = scales  # * np.sqrt(ratios)
-    depths = scales
-
-    # Enumerate shifts in feature space
-    shifts_y = np.arange(0, shape[0], anchor_stride) * feature_stride
-    shifts_x = np.arange(0, shape[1], anchor_stride) * feature_stride
-    shifts_z = np.arange(0, shape[2], anchor_stride) * feature_stride
+    # сетка центров в координатах исходника
+    shifts_y = np.arange(0, shape[0], anchor_stride) * sy
+    shifts_x = np.arange(0, shape[1], anchor_stride) * sx
+    shifts_z = np.arange(0, shape[2], anchor_stride) * sz
     shifts_x, shifts_y, shifts_z = np.meshgrid(shifts_x, shifts_y, shifts_z)
 
-    # Enumerate combinations of shifts, widths, and heights and depths
-    box_widths, box_centers_x = np.meshgrid(widths, shifts_x)
+    # размеры: по XY — scale, по Z — scale * ratio
+    S, R = np.meshgrid(np.array(scales, dtype=np.float32),
+                       np.array(ratios, dtype=np.float32))
+    S = S.flatten(); R = R.flatten()
+    heights = S
+    widths  = S
+    depths  = S * R
+
+    box_widths,  box_centers_x = np.meshgrid(widths,  shifts_x)
     box_heights, box_centers_y = np.meshgrid(heights, shifts_y)
-    box_depths, box_centers_z = np.meshgrid(depths, shifts_z)
+    box_depths,  box_centers_z = np.meshgrid(depths,  shifts_z)
 
-    # Reshape to get a list of (y, x, z) and a list of (h, w, d)
-    box_centers = np.stack(
-        [box_centers_y, box_centers_x, box_centers_z], axis=2).reshape([-1, 3])
-    box_sizes = np.stack([box_heights, box_widths, box_depths], axis=2).reshape([-1, 3])
+    box_centers = np.stack([box_centers_y, box_centers_x, box_centers_z], axis=2).reshape([-1, 3])
+    box_sizes   = np.stack([box_heights,  box_widths,   box_depths],    axis=2).reshape([-1, 3])
 
-    # Convert to corner coordinates (y1, x1, z1, y2, x2, z2)
+    # (y1, x1, z1, y2, x2, z2)
     boxes = np.concatenate([box_centers - 0.5 * box_sizes,
                             box_centers + 0.5 * box_sizes], axis=1)
-    # print(shape,boxes, len(boxes))
     return boxes
 
 
-def generate_pyramid_anchors(scales, ratios, feature_shapes, feature_strides,
-                             anchor_stride):
-    """Generate anchors at different levels of a feature pyramid. Each scale
-    is associated with a level of the pyramid, but each ratio is used in
-    all levels of the pyramid.
-
-    Returns:
-    anchors: [N, (y1, x1, z1, y2, x2, z2)]. All generated anchors in one array. Sorted
-        with the same order of the given scales. So, anchors of scale[0] come
-        first, then anchors of scale[1], and so on.
-    """
-    # Anchors
-    # [anchor_count, (y1, x1, z1, y2, x2, z2)]
+def generate_pyramid_anchors(scales, ratios, feature_shapes, feature_strides, anchor_stride):
     anchors = []
     for i in range(len(scales)):
-        x = generate_anchors(scales[i], ratios, feature_shapes[i],
-                             feature_strides[i], anchor_stride)
-        anchors.append(x)
-    y = np.concatenate(anchors, axis=0)
-    return y
+        anchors.append(generate_anchors(scales[i], ratios, feature_shapes[i],
+                                        feature_strides[i], anchor_stride))
+    return np.concatenate(anchors, axis=0)
 
 
 ############################################################
@@ -719,6 +705,7 @@ def compute_ap(gt_boxes, gt_class_ids, gt_masks,
 
 
 def rpn_evaluation(model, config, subsets, datasets, check_boxes):
+    IOU_THRESH = 0.5
     max_object_nb = 2 * config.MAX_GT_INSTANCES
     for subset, dataset in zip(subsets, datasets):
         print(subset)
@@ -728,34 +715,63 @@ def rpn_evaluation(model, config, subsets, datasets, check_boxes):
         class_loss = []
         bbox_loss = []
         checked = 0
-        for k in range(config.EVALUATION_STEPS):
+        steps = min(config.EVALUATION_STEPS, len(generator))
+
+        for k in range(steps):
             inputs, _ = generator.__getitem__(k)
             _, _, _, batch_rpn_rois, rpn_class_loss, rpn_bbox_loss = model.predict(inputs)
             
             for m in range(batch_rpn_rois.shape[0]):
-                _, boxes, _ = generator.load_image_gt(k * config.BATCH_SIZE + m)
-                
+                ds_id = generator.image_ids[k * generator.batch_size + m]
+                _, boxes, _ = generator.load_image_gt(ds_id)
+                if boxes is None or boxes.shape[0] == 0:
+                    class_loss.append(rpn_class_loss[m])
+                    bbox_loss.append(rpn_bbox_loss[m])
+                    continue
                 rpn_rois = denorm_boxes(batch_rpn_rois[m, :max_object_nb], config.IMAGE_SHAPE[:3])
-                if gt_boxes.shape[0] == 0 or rpn_rois.shape[0] == 0:
+                if rpn_rois is None or rpn_rois.shape[0] == 0:
+                    # учтём лоссы, но дальше не считаем метрики
+                    class_loss.append(rpn_class_loss[m])
+                    bbox_loss.append(rpn_bbox_loss[m])
+                    continue
+                # обрезаем по размеру изображения и фильтруем нулевую/отрицательную площадь
+                H, W, D = config.IMAGE_SHAPE[:3]
+                rpn_rois[:, 0] = np.clip(rpn_rois[:, 0], 0, H)  # y1
+                rpn_rois[:, 1] = np.clip(rpn_rois[:, 1], 0, W)  # x1
+                rpn_rois[:, 2] = np.clip(rpn_rois[:, 2], 0, D)  # z1
+                rpn_rois[:, 3] = np.clip(rpn_rois[:, 3], 0, H)  # y2
+                rpn_rois[:, 4] = np.clip(rpn_rois[:, 4], 0, W)  # x2
+                rpn_rois[:, 5] = np.clip(rpn_rois[:, 5], 0, D)  # z2
+                valid = (rpn_rois[:, 3] > rpn_rois[:, 0]) & (rpn_rois[:, 4] > rpn_rois[:, 1]) & (
+                            rpn_rois[:, 5] > rpn_rois[:, 2])
+                rpn_rois = rpn_rois[valid]
+                if rpn_rois.shape[0] == 0:
+                    class_loss.append(rpn_class_loss[m])
+                    bbox_loss.append(rpn_bbox_loss[m])
                     continue
                 overlaps = compute_overlaps(boxes, rpn_rois)
-                
-                roi_association = -1 * np.ones(boxes.shape[0]).astype(np.uint8)
-                box_association = -1 * np.ones(rpn_rois.shape[0]).astype(np.uint8)
+
+                roi_association = -1 * np.ones(boxes.shape[0], dtype=np.int32)
+                box_association = -1 * np.ones(rpn_rois.shape[0], dtype=np.int32)
                 for j in range(rpn_rois.shape[0]):
                     roi_overlaps = overlaps[:, j]
 
                     argmax = np.argmax(roi_overlaps)
                     if roi_association[argmax] == -1:
-                        if roi_overlaps[argmax] > 0.5:
+                        if roi_overlaps[argmax] > IOU_THRESH:
                             roi_association[argmax] = j
                             box_association[j] = argmax
-                
-                roi_association = [indice for indice in roi_association if indice != -1]
-                box_association = [indice for indice in box_association if indice != -1]
 
+                roi_association = [i for i in roi_association if i != -1]
+                if len(roi_association) == 0:
+                    detection_scores.append(0.0)
+                    class_loss.append(rpn_class_loss[m])
+                    bbox_loss.append(rpn_bbox_loss[m])
+                    continue
+
+                box_association = [indice for indice in box_association if indice != -1]
                 box_association.sort()
-                
+
                 positive_rois = rpn_rois[roi_association]
                 positive_boxes = boxes[box_association]
 
@@ -764,18 +780,18 @@ def rpn_evaluation(model, config, subsets, datasets, check_boxes):
                     print("GT:", positive_boxes)
                     checked += 1
 
-                bbox_errors.append(np.mean(np.abs(positive_rois - positive_boxes)))
-                detection_scores.append(100 * positive_rois.shape[0] / boxes.shape[0])
+                bbox_errors.append(float(np.mean(np.abs(positive_rois - positive_boxes))))
+                detection_scores.append(100.0 * positive_rois.shape[0] / max(1, boxes.shape[0]))
 
                 class_loss.append(rpn_class_loss[m])
                 bbox_loss.append(rpn_bbox_loss[m])
 
-        mean_class_loss = np.mean(class_loss)
-        std_class_loss = np.std(class_loss)
-        mean_bbox_loss = np.mean(bbox_loss)
-        std_bbox_loss = np.std(bbox_loss)
-        mean_bbox_error = np.mean(bbox_errors)
-        mean_detection_score = np.mean(detection_scores)
+        mean_class_loss = float(np.mean(class_loss)) if len(class_loss) else 0.0
+        std_class_loss = float(np.std(class_loss)) if len(class_loss) else 0.0
+        mean_bbox_loss = float(np.mean(bbox_loss)) if len(bbox_loss) else 0.0
+        std_bbox_loss = float(np.std(bbox_loss)) if len(bbox_loss) else 0.0
+        mean_bbox_error = float(np.mean(bbox_errors)) if len(bbox_errors) else 0.0
+        mean_detection_score = float(np.mean(detection_scores)) if len(detection_scores) else 0.0
 
         print("CLASS:", mean_class_loss, "+/-", std_class_loss, 
               "BBOX:", mean_bbox_loss, "+/-", std_bbox_loss)
@@ -784,7 +800,7 @@ def rpn_evaluation(model, config, subsets, datasets, check_boxes):
 
 
 def head_evaluation(model, config, subsets, datasets):
-    
+
     for subset, dataset in zip(subsets, datasets):
 
         print(subset)
@@ -793,8 +809,11 @@ def head_evaluation(model, config, subsets, datasets):
         class_losses = []
         bbox_losses = []
         mask_losses = []
-
-        for id in range(config.EVALUATION_STEPS):
+        steps = min(config.EVALUATION_STEPS, len(data_generator))
+        if steps == 0:
+            print("No positive samples after filtering. Skipping evaluation for this subset.")
+            continue
+        for id in range(steps):
 
             inputs, _ = data_generator.__getitem__(id)
             outputs = model.predict(inputs)
@@ -803,12 +822,12 @@ def head_evaluation(model, config, subsets, datasets):
             bbox_losses.append(bbox_loss[0])
             mask_losses.append(mask_loss[0])
 
-        mean_class_loss = np.mean(class_losses)
-        std_class_loss = np.std(class_losses)
-        mean_bbox_loss = np.mean(bbox_losses)
-        std_bbox_loss = np.std(bbox_losses)
-        mean_mask_loss = np.mean(mask_losses)
-        std_mask_loss = np.std(mask_losses)
+        mean_class_loss = float(np.mean(class_losses)) if class_losses else 0.0
+        std_class_loss = float(np.std(class_losses)) if class_losses else 0.0
+        mean_bbox_loss = float(np.mean(bbox_losses)) if bbox_losses else 0.0
+        std_bbox_loss = float(np.std(bbox_losses)) if bbox_losses else 0.0
+        mean_mask_loss = float(np.mean(mask_losses)) if mask_losses else 0.0
+        std_mask_loss = float(np.std(mask_losses)) if mask_losses else 0.0
 
         print("CLASS:", mean_class_loss, "+/-", std_class_loss, 
               "BBOX:", mean_bbox_loss, "+/-", std_bbox_loss, 

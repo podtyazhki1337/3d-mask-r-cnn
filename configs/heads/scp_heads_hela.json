@@ -1,27 +1,27 @@
-{
-    "DATA_DIR": "/NAS/mmaiurov/Datasets/rat_neurons_3d_tif_256_patches/",
+{   
+    "DATA_DIR": "/NAS/mmaiurov/Datasets/hela_mrc_patches256/scp_target/",
     "NUM_CLASSES": 2,
     "IMAGE_SIZE": 256,
     "IMAGE_DEPTH": 12,
     "IMAGE_CHANNEL_COUNT": 1,
     "MAX_GT_INSTANCES": 20,
     "USE_MINI_MASK": false,
-    "EVALUATION_STEPS": 400,
+    "TARGET_RATIO": 0.2,
+    "EVALUATION_STEPS": 36,
 
     "MODE": "training",
 
-    "BACKBONE": "resnet50",
     "TOP_DOWN_PYRAMID_SIZE": 256,
-    "RPN_TRAIN_ANCHORS_PER_IMAGE": 500,
-    "PRE_NMS_LIMIT": 2000,
-    "POST_NMS_ROIS_TRAINING": 300,
-    "POST_NMS_ROIS_INFERENCE": 300,
+    
+    "TRAIN_ROIS_PER_IMAGE": 16,
+    "ROI_POSITIVE_RATIO": 0.33, 
+    "FPN_CLASSIF_FC_LAYERS_SIZE": 512,
 
     "IMAGES_PER_GPU": 1,
     "GPU_COUNT": 1,
-    "LOSS_WEIGHTS": {"rpn_class_loss": 1.0, "rpn_bbox_loss": 1.0},
+    "LOSS_WEIGHTS": {"mrcnn_class_loss": 1.0, "mrcnn_bbox_loss": 1.0, "mrcnn_mask_loss": 1.0}, 
     "OPTIMIZER": {"name": "SGD", "parameters": {"learning_rate": 1e-3, "momentum": 0.9}},
-    "WEIGHT_DIR": "weights/scp_rpn_rats/",
+    "WEIGHT_DIR": "./weights/scp_heads_hela/",
     "EPOCHS": 40,
     "FROM_EPOCH": 0
 }

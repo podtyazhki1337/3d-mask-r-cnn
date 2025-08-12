@@ -63,14 +63,19 @@ def compute_backbone_shapes(config, image_shape):
     """
     if callable(config.BACKBONE):
         return config.COMPUTE_BACKBONE_SHAPE(image_shape)
-
-    # Currently supports ResNet only
     assert config.BACKBONE in ["resnet50", "resnet101"]
-    return np.array(
-        [[int(math.ceil(image_shape[0] / stride)),
-          int(math.ceil(image_shape[1] / stride)),
-          int(math.ceil(image_shape[2] / stride))]
-         for stride in config.BACKBONE_STRIDES])
+    shapes = []
+    for stride in config.BACKBONE_STRIDES:
+        if isinstance(stride, (int, np.integer)):
+            sy = sx = sz = int(stride)
+        else:
+            sy, sx, sz = stride
+        shapes.append([
+            int(math.ceil(image_shape[0] / sy)),
+            int(math.ceil(image_shape[1] / sx)),
+            int(math.ceil(image_shape[2] / sz)),
+        ])
+    return np.array(shapes)
 
 
 ############################################################

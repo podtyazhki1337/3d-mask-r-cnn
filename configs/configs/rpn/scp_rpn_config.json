@@ -1,5 +1,5 @@
 {
-    "DATA_DIR": "/NAS/mmaiurov/Datasets/rat_neurons_3d_tif_256_patches/",
+    "DATA_DIR": "/NAS/mmaiurov/Datasets/hela_mrc_patches256/",
     "NUM_CLASSES": 2,
     "IMAGE_SIZE": 256,
     "IMAGE_DEPTH": 12,
@@ -21,7 +21,7 @@
     "GPU_COUNT": 1,
     "LOSS_WEIGHTS": {"rpn_class_loss": 1.0, "rpn_bbox_loss": 1.0},
     "OPTIMIZER": {"name": "SGD", "parameters": {"learning_rate": 1e-3, "momentum": 0.9}},
-    "WEIGHT_DIR": "weights/scp_rpn_rats/",
+    "WEIGHT_DIR": "weights/scp_rpn_hela/",
     "EPOCHS": 40,
     "FROM_EPOCH": 0
 }
