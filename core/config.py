@@ -22,7 +22,7 @@ class Config(object):
         IMAGE_SIZE = 256,
         IMAGE_DEPTH = 12,
         IMAGE_CHANNEL_COUNT = 1,
-        MAX_GT_INSTANCES = 771,
+        MAX_GT_INSTANCES = 50,
         TARGET_RATIO = 0.2,
         USE_MINI_MASK = True,
         MINI_MASK_SHAPE = (56, 56, 56),
@@ -36,35 +36,38 @@ class Config(object):
 
         # RPN
         BACKBONE = "resnet50",
-        BACKBONE_STRIDES = [(4, 4, 2), (8, 8, 2), (16, 16, 2), (32, 32, 2), (64, 64, 4)],
+        BACKBONE_STRIDES = [(4,4,1), (8,8,1), (16,16,1), (32,32,1), (64,64,2)],
         TOP_DOWN_PYRAMID_SIZE = 256,
-        RPN_ANCHOR_SCALES = (32, 64, 96, 128, 160),
-        RPN_ANCHOR_RATIOS = [0.125, 0.25, 0.5, 1.0],
+        RPN_ANCHOR_SCALES = (24, 39, 56, 84, 96),
+        RPN_ANCHOR_RATIOS = [0.05, 0.075, 0.1, 0.15, 0.25],
         RPN_ANCHOR_STRIDE = 1,
-        RPN_TRAIN_ANCHORS_PER_IMAGE = 512,
-        RPN_NMS_THRESHOLD = 0.7,
-        PRE_NMS_LIMIT = 6000,
-        POST_NMS_ROIS_TRAINING = 2000, 
-        POST_NMS_ROIS_INFERENCE = 1000,
+        RPN_TRAIN_ANCHORS_PER_IMAGE = 1024,
+        RPN_NMS_THRESHOLD = 0.9,
+        PRE_NMS_LIMIT = 10000,
+        POST_NMS_ROIS_TRAINING = 3000,
+        POST_NMS_ROIS_INFERENCE = 1500,
 
         # Head
-        TRAIN_ROIS_PER_IMAGE = 200, 
-        ROI_POSITIVE_RATIO = 0.33, 
+        TRAIN_ROIS_PER_IMAGE = 512,
+        ROI_POSITIVE_RATIO = 0.33,
         POOL_SIZE = 7, 
         MASK_POOL_SIZE = 14,
         FPN_CLASSIF_FC_LAYERS_SIZE = 1024, 
         HEAD_CONV_CHANNEL = 256,
         MASK_SHAPE = [28, 28, 28], 
-
+        TELEMETRY=True,
+        TELEMETRY_SAMPLE=0.02,
+        EVAL_DET_IOU=0.4,
         # Detection
-        DETECTION_MAX_INSTANCES = 100,
-        DETECTION_MIN_CONFIDENCE = 0.7, 
-        DETECTION_NMS_THRESHOLD = 0.3,
-
+        DETECTION_MAX_INSTANCES = 50,
+        DETECTION_MIN_CONFIDENCE = 0.2,
+        DETECTION_NMS_THRESHOLD = 0.45,
+        RPN_POSITIVE_IOU= 0.60,
+        RPN_NEGATIVE_IOU= 0.30,
         # Training
         IMAGES_PER_GPU = 1, 
         GPU_COUNT = 1, 
-        LOSS_WEIGHTS = {"rpn_class_loss": 1., "rpn_bbox_loss": 1., "mrcnn_class_loss": 1., "mrcnn_bbox_loss": 1., "mrcnn_mask_loss": 1.}, 
+        LOSS_WEIGHTS = {"rpn_class_loss": 1., "rpn_bbox_loss": 1., "mrcnn_class_loss": 1., "mrcnn_bbox_loss": 1., "mrcnn_mask_loss": 1., "mrcnn_obj_loss": 0.5, "mrcnn_margin_loss": 0.0},
         TRAIN_BN = False,
         LEARNING_LAYERS = "all", 
         OPTIMIZER = {"name": "SGD", "parameters": {}},
@@ -74,7 +77,39 @@ class Config(object):
         MASK_WEIGHTS = None,
         EPOCHS = 1, 
         FROM_EPOCH = 0,
-        WEIGHT_DECAY = 0.0001
+        WEIGHT_DECAY = 0.0001,
+        EVAL_TOPK_RPN = 512,
+        EVAL_MATCH_IOU = 0.50,
+        EVAL_MATCH_IOU_GRID = [0.30, 0.40, 0.50],
+        EVAL_TOPK_GRID = [500, 1000, 2000, 4000, 6000, 8000],
+
+        AUTO_TUNE_RPN=False,
+        AUTO_TUNE_SAVE_PATCH=True,
+        AUTO_TUNE_SNAP_SCALE_STEP=8,
+        AUTO_TUNE_SNAP_RATIO_STEP=0.02,
+        AUTO_TUNE_RATIO_RANGE=[0.04, 0.30],
+        AUTO_TUNE_SCALES_LIMIT=8,
+        AUTO_TUNE_RATIOS_LIMIT=8,
+
+        AUGMENT= True,
+        AUG_PROB=0.5,
+        AUG_FLIP_Y=True,
+        AUG_FLIP_X=True,
+        AUG_FLIP_Z=False,
+        AUG_BRIGHTNESS_DELTA=0.03,
+        AUG_GAUSS_NOISE_STD=0.0,
+        RPN_AUGMENT_GT=True,
+        RPN_GT_JITTER_PER_BOX=3,
+        RPN_GT_JITTER_SCALE_SIGMA=0.10,
+        RPN_GT_JITTER_TRANS=[2, 2, 1],
+        ATSS_TOPK=12,
+        ATSS_MIN_POS_PER_GT=3,
+        RPN_GT_JITTER_IOU_THR=0.4,
+
+        HEAD_SHUFFLE_ROIS=False,
+        HEAD_BALANCE_POS=False,
+        HEAD_POS_FRAC=0.25
+
     ):
 
         ###########################################
@@ -152,7 +187,8 @@ class Config(object):
         # In order to play with this parameter, must adapt utils.generate_pyramid_anchors
         # We developed one, ask in Git issue
         self.RPN_ANCHOR_RATIOS = RPN_ANCHOR_RATIOS
-
+        self.RPN_POSITIVE_IOU = RPN_POSITIVE_IOU
+        self.RPN_NEGATIVE_IOU = RPN_NEGATIVE_IOU
         # Anchor stride
         # If 1 then anchors are created for each cell in the backbone feature map.
         # If 2, then anchors are created for every other cell, and so on.
@@ -171,7 +207,9 @@ class Config(object):
         # ROIs kept after non-maximum suppression (training and inference)
         self.POST_NMS_ROIS_TRAINING = POST_NMS_ROIS_TRAINING
         self.POST_NMS_ROIS_INFERENCE = POST_NMS_ROIS_INFERENCE
-
+        self.EVAL_MATCH_IOU = EVAL_MATCH_IOU
+        self.EVAL_MATCH_IOU_GRID = EVAL_MATCH_IOU_GRID
+        self.EVAL_TOPK_RPN = EVAL_TOPK_RPN
         # Compute the number of anchors, useful in debugging
         # self.ANCHOR_NB = int( (self.IMAGE_SHAPE[0] / self.BACKBONE_STRIDES[0])**3 + \
         #                     (self.IMAGE_SHAPE[0] / self.BACKBONE_STRIDES[1])**3 + \
@@ -289,7 +327,39 @@ class Config(object):
 
         # Weight decay regularization
         self.WEIGHT_DECAY = WEIGHT_DECAY
-    
+        self.TELEMETRY = TELEMETRY
+        self.TELEMETRY_SAMPLE = TELEMETRY_SAMPLE
+        self.EVAL_DET_IOU = EVAL_DET_IOU
+        self.EVAL_TOPK_GRID=EVAL_TOPK_GRID
+
+        self.AUTO_TUNE_RPN=AUTO_TUNE_RPN
+        self.AUTO_TUNE_SAVE_PATCH=AUTO_TUNE_SAVE_PATCH
+        self.AUTO_TUNE_SNAP_SCALE_STEP=AUTO_TUNE_SNAP_SCALE_STEP
+        self.AUTO_TUNE_SNAP_RATIO_STEP=AUTO_TUNE_SNAP_RATIO_STEP
+        self.AUTO_TUNE_RATIO_RANGE=AUTO_TUNE_RATIO_RANGE
+        self.AUTO_TUNE_SCALES_LIMIT=AUTO_TUNE_SCALES_LIMIT
+        self.AUTO_TUNE_RATIOS_LIMIT=AUTO_TUNE_RATIOS_LIMIT
+
+        self.ATSS_TOPK=ATSS_TOPK
+        self.ATSS_MIN_POS_PER_GT=ATSS_MIN_POS_PER_GT
+
+        self.AUGMENT=  AUGMENT
+        self.AUG_PROB= AUG_PROB
+        self.AUG_FLIP_Y=AUG_FLIP_Y
+        self.AUG_FLIP_X=AUG_FLIP_X
+        self.AUG_FLIP_Z=AUG_FLIP_Z
+        self.AUG_BRIGHTNESS_DELTA=AUG_BRIGHTNESS_DELTA
+        self.AUG_GAUSS_NOISE_STD=AUG_GAUSS_NOISE_STD
+        self.RPN_AUGMENT_GT=RPN_AUGMENT_GT
+        self.RPN_GT_JITTER_PER_BOX=RPN_GT_JITTER_PER_BOX
+        self.RPN_GT_JITTER_SCALE_SIGMA=RPN_GT_JITTER_SCALE_SIGMA
+        self.RPN_GT_JITTER_TRANS=RPN_GT_JITTER_TRANS
+        self.RPN_GT_JITTER_IOU_THR=RPN_GT_JITTER_IOU_THR
+
+        self.HEAD_SHUFFLE_ROIS=HEAD_SHUFFLE_ROIS
+        self.HEAD_BALANCE_POS=HEAD_BALANCE_POS
+        self.HEAD_POS_FRAC=HEAD_POS_FRAC
+
     def display(self):
         """
         Display Configuration values.

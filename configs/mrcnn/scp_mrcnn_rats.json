@@ -1,10 +1,10 @@
 {   
     "DATA_DIR": "/NAS/mmaiurov/Datasets/rat_neurons_3d_tif_256_patches/",
     "NUM_CLASSES": 2,
-    "IMAGE_SIZE": 64,
+    "IMAGE_SIZE": 256,
     "IMAGE_DEPTH": 12,
     "IMAGE_CHANNEL_COUNT": 1,
-    "MAX_GT_INSTANCES": 20, 
+    "MAX_GT_INSTANCES": 25,
     "USE_MINI_MASK": false, 
     "OUTPUT_DIR": "/NAS/mmaiurov/Datasets/rat_neurons_3d_tif_256_patches/results/",
 
@@ -12,16 +12,16 @@
 
     "BACKBONE": "resnet50", 
     "TOP_DOWN_PYRAMID_SIZE": 256, 
-    "RPN_TRAIN_ANCHORS_PER_IMAGE": 500,
-    "PRE_NMS_LIMIT": 2000, 
-    "POST_NMS_ROIS_TRAINING": 300,
-    "POST_NMS_ROIS_INFERENCE": 300,
+    "RPN_TRAIN_ANCHORS_PER_IMAGE": 4096,
+    "PRE_NMS_LIMIT": 30000,
+    "POST_NMS_ROIS_TRAINING": 4000,
+    "POST_NMS_ROIS_INFERENCE": 3500,
 
-    "TRAIN_ROIS_PER_IMAGE": 16,
-    "ROI_POSITIVE_RATIO": 0.2, 
+    "TRAIN_ROIS_PER_IMAGE": 512,
+    "ROI_POSITIVE_RATIO": 0.5,
     "FPN_CLASSIF_FC_LAYERS_SIZE": 512,
     "DETECTION_MAX_INSTANCES": 40,
-    "DETECTION_MIN_CONFIDENCE": 0.4,
+    "DETECTION_MIN_CONFIDENCE": 0.35,
 
     "GPU_COUNT": 1, 
     "IMAGES_PER_GPU": 1,
@@ -30,6 +30,17 @@
     "WEIGHT_DIR": "weights/scp_mrcnn_rats/",
     "EPOCHS": 20, 
     "FROM_EPOCH": 0,
-    "RPN_WEIGHTS": "weights/scp_rpn_rats/epoch_009.h5",
-    "HEAD_WEIGHTS": "weights/scp_heads/epoch_.h5"
+    "RPN_WEIGHTS": "weights/scp_rpn_rats/EPOCH_006.h5",
+    "HEAD_WEIGHTS": "weights/scp_heads_rats/best.h5",
+
+    "BACKBONE_STRIDES": [[4,4,2],[8,8,2],[16,16,2],[32,32,2],[64,64,2]],
+    "RPN_ANCHOR_SCALES": [48, 56, 64, 80, 120],
+    "RPN_ANCHOR_RATIOS": [0.04, 0.06, 0.08, 0.01, 0.11, 0.12],
+    "RPN_ANCHOR_STRIDE":  1,
+    "RPN_BBOX_STD_DEV": [0.10, 0.10, 0.08, 0.20, 0.20, 0.15],
+    "HEAD_CONV_CHANNEL": 128,
+    "DETECTION_NMS_THRESHOLD": 0.45,
+    "ATSS_TOPK": 12,
+    "ATSS_MIN_POS_PER_GT": 3,
+    "AUGMENT": false
 }

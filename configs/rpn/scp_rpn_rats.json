@@ -1,0 +1,76 @@
+{
+    "DATA_DIR": "/NAS/mmaiurov/Datasets/rat_neurons_3d_tif_256_patches/",
+    "NUM_CLASSES": 2,
+    "IMAGE_SIZE": 256,
+    "IMAGE_DEPTH": 12,
+    "IMAGE_CHANNEL_COUNT": 1,
+    "MAX_GT_INSTANCES": 25,
+    "USE_MINI_MASK": false,
+    "EVALUATION_STEPS": 400,
+    "RPN_ANCHOR_SCALES": [48, 56, 64, 80, 120],
+    "RPN_ANCHOR_RATIOS": [0.04, 0.06, 0.08, 0.01, 0.11, 0.12],
+    "RPN_ANCHOR_STRIDE":  1,
+    "RPN_BBOX_STD_DEV": [0.10, 0.10, 0.08, 0.20, 0.20, 0.15],
+    "RPN_NMS_THRESHOLD": 0.7,
+    "MODE": "training",
+
+    "RPN_POSITIVE_IOU": 0.3,
+    "RPN_NEGATIVE_IOU": 0.1,
+
+    "BACKBONE_STRIDES": [[4,4,2],[8,8,2],[16,16,2],[32,32,2],[64,64,2]],
+    "BACKBONE": "resnet50",
+
+    "TOP_DOWN_PYRAMID_SIZE": 256,
+    "RPN_TRAIN_ANCHORS_PER_IMAGE": 4096,
+    "PRE_NMS_LIMIT": 30000,
+    "POST_NMS_ROIS_TRAINING": 4000,
+    "POST_NMS_ROIS_INFERENCE": 3500,
+
+    "ROI_POSITIVE_RATIO": 0.5,
+    "ATSS_TOPK": 12,
+    "ATSS_MIN_POS_PER_GT": 3,
+
+
+    "DETECTION_MIN_CONFIDENCE": 0.35,
+    "DETECTION_NMS_THRESHOLD": 0.45,
+
+    "TRAIN_ROIS_PER_IMAGE": 512,
+
+    "IMAGES_PER_GPU": 1,
+    "GPU_COUNT": 1,
+    "LOSS_WEIGHTS": {"rpn_class_loss": 1.0, "rpn_bbox_loss": 1.3},
+    "OPTIMIZER": {"name": "SGD", "parameters": {"learning_rate": 3e-4, "momentum": 0.9,"decay": 1e-4}},
+    "WEIGHT_DECAY": 0.0001,
+    "WEIGHT_DIR": "weights/scp_rpn_rats/",
+    "EPOCHS": 300,
+    "FROM_EPOCH": 0,
+
+    "AUGMENT": true,
+    "AUG_PROB": 0.5,
+    "AUG_FLIP_Y": true,
+    "AUG_FLIP_X": true,
+    "AUG_FLIP_Z": false,
+    "AUG_BRIGHTNESS_DELTA": 0.02,
+    "AUG_GAUSS_NOISE_STD": 0,
+    "RPN_AUGMENT_GT": true,
+    "RPN_GT_JITTER_PER_BOX": 3,
+    "RPN_GT_JITTER_SCALE_SIGMA": 0.05,
+    "RPN_GT_JITTER_TRANS": [1, 1, 1],
+    "RPN_GT_JITTER_IOU_THR": 0.55,
+
+    "EVAL_MATCH_IOU": 0.50,
+    "EVAL_MATCH_IOU_GRID": [0.30, 0.40, 0.50],
+    "EVAL_TOPK_GRID": [6000, 8000],
+    "EVAL_DET_IOU": 0.30,
+    "EVAL_TOPK_RPN": 4000,
+    "TELEMETRY": true,
+    "TELEMETRY_SAMPLE": 0.02,
+
+    "AUTO_TUNE_RPN": true,
+    "AUTO_TUNE_SAVE_PATCH": true,
+    "AUTO_TUNE_SNAP_SCALE_STEP": 8,
+    "AUTO_TUNE_SNAP_RATIO_STEP": 0.02,
+    "AUTO_TUNE_RATIO_RANGE": [0.04, 0.30],
+    "AUTO_TUNE_SCALES_LIMIT": 8,
+    "AUTO_TUNE_RATIOS_LIMIT": 8
+}

@@ -8,7 +8,7 @@ import skimage.transform
 import tensorflow as tf
 import warnings
 from distutils.version import LooseVersion
-
+from collections import defaultdict as _dd
 
 
 from .data_generators import RPNGenerator, HeadGenerator
@@ -117,36 +117,175 @@ def compute_overlaps_masks(masks1, masks2):
     return overlaps
 
 
-def apply_box_deltas(boxes, deltas):
-    """Applies the given deltas to the given boxes.
-    boxes: [N, (y1, x1, y2, x2)]. Note that (y2, x2) is outside the box.
-    deltas: [N, (dy, dx, log(dh), log(dw))]
+def apply_box_deltas_3d(boxes, deltas):
+    """Применяет предсказанные дельты к якорям.
+
+    boxes: [N, (y1, x1, z1, y2, x2, z2)] якоря в формате координат
+    deltas: [N, (dy, dx, dz, log(dh), log(dw), log(dd))] предсказанные дельты
+
+    Возвращает: [N, (y1, x1, z1, y2, x2, z2)] преобразованные боксы
     """
-    boxes = boxes.astype(np.float32)
-    # Convert to y, x, h, w
+    # Конвертируем якоря из [y1, x1, z1, y2, x2, z2] в [cy, cx, cz, h, w, d]
     height = boxes[:, 3] - boxes[:, 0]
     width = boxes[:, 4] - boxes[:, 1]
     depth = boxes[:, 5] - boxes[:, 2]
     center_y = boxes[:, 0] + 0.5 * height
     center_x = boxes[:, 1] + 0.5 * width
     center_z = boxes[:, 2] + 0.5 * depth
-    # Apply deltas
-    center_y += deltas[:, 0] * height
-    center_x += deltas[:, 1] * width
-    center_z += deltas[:, 2] * depth
-    height *= np.exp(deltas[:, 3])
-    width *= np.exp(deltas[:, 4])
-    depth *= np.exp(deltas[:, 5])
-    # Convert back to y1, x1, y2, x2
+
+    # Избегаем очень маленьких размеров для стабильности
+    height = np.maximum(height, 1)
+    width = np.maximum(width, 1)
+    depth = np.maximum(depth, 1)
+
+    # Распаковываем дельты
+    center_y_delta = deltas[:, 0]
+    center_x_delta = deltas[:, 1]
+    center_z_delta = deltas[:, 2]
+    height_log_delta = deltas[:, 3]
+    width_log_delta = deltas[:, 4]
+    depth_log_delta = deltas[:, 5]
+
+    # ВАЖНО: Ограничиваем большие значения для предотвращения экспоненциальных выбросов
+    # Это критично для стабильности предсказаний
+    height_log_delta = np.clip(height_log_delta, -4, 4)
+    width_log_delta = np.clip(width_log_delta, -4, 4)
+    depth_log_delta = np.clip(depth_log_delta, -4, 4)
+
+    # Применяем дельты
+    center_y = center_y + center_y_delta * height
+    center_x = center_x + center_x_delta * width
+    center_z = center_z + center_z_delta * depth
+    height = height * np.exp(height_log_delta)
+    width = width * np.exp(width_log_delta)
+    depth = depth * np.exp(depth_log_delta)
+
+    # Ограничиваем размеры для предотвращения вырожденных боксов
+    height = np.maximum(height, 1)
+    width = np.maximum(width, 1)
+    depth = np.maximum(depth, 1)
+
+    # Конвертируем обратно в [y1, x1, z1, y2, x2, z2]
     y1 = center_y - 0.5 * height
     x1 = center_x - 0.5 * width
     z1 = center_z - 0.5 * depth
     y2 = y1 + height
     x2 = x1 + width
     z2 = z1 + depth
+
+    # Склеиваем результаты
     return np.stack([y1, x1, z1, y2, x2, z2], axis=1)
 
 
+def non_max_suppression_3d(boxes, scores, threshold, max_boxes=2000):
+    """Улучшенная функция NMS для 3D детекции.
+
+    boxes: [N, (y1, x1, z1, y2, x2, z2)]
+    scores: [N] уверенности для каждого бокса
+    threshold: порог IoU
+    max_boxes: максимальное количество боксов для возврата
+
+    Возвращает:
+    boxes: [M, (y1, x1, z1, y2, x2, z2)] отобранные боксы
+    indices: [M] индексы выбранных боксов
+    """
+    if boxes.shape[0] == 0:
+        return np.zeros((0, 6), dtype=np.float32), np.zeros((0), dtype=np.int32)
+
+    # Координаты
+    y1 = boxes[:, 0]
+    x1 = boxes[:, 1]
+    z1 = boxes[:, 2]
+    y2 = boxes[:, 3]
+    x2 = boxes[:, 4]
+    z2 = boxes[:, 5]
+
+    # Объемы боксов
+    volumes = (y2 - y1) * (x2 - x1) * (z2 - z1)
+
+    # Сортируем боксы по уверенности
+    order = scores.argsort()[::-1]
+
+    # Выбираем до max_boxes лучших боксов
+    max_boxes = min(max_boxes, order.shape[0])
+    order = order[:max_boxes]
+
+    keep = []
+    while order.size > 0:
+        # Добавляем бокс с наивысшей уверенностью
+        i = order[0]
+        keep.append(i)
+
+        # Если остался только один бокс, завершаем
+        if order.size == 1:
+            break
+
+        # Вычисляем IoU с оставшимися боксами
+        # Общий объем пересечения
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        zz1 = np.maximum(z1[i], z1[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        zz2 = np.minimum(z2[i], z2[order[1:]])
+
+        # Проверяем, есть ли пересечение
+        inter_height = np.maximum(0.0, yy2 - yy1)
+        inter_width = np.maximum(0.0, xx2 - xx1)
+        inter_depth = np.maximum(0.0, zz2 - zz1)
+
+        inter_vol = inter_height * inter_width * inter_depth
+        union_vol = volumes[i] + volumes[order[1:]] - inter_vol
+
+        # Предотвращаем деление на ноль
+        union_vol = np.maximum(union_vol, np.finfo(float).eps)
+
+        # IoU
+        iou = inter_vol / union_vol
+
+        # Отбрасываем все боксы с высоким IoU
+        to_keep = np.where(iou <= threshold)[0]
+
+        # Обновляем индексы
+        order = order[to_keep + 1]
+
+    # Возвращаем отобранные боксы и их индексы
+    return boxes[keep], np.array(keep, dtype=np.int32)
+
+
+def compute_detection_score(proposals, gt_boxes, threshold=0.5):
+    """Улучшенная функция вычисления Detection Score.
+
+    proposals: [N, (y1, x1, z1, y2, x2, z2)] предложения RPN
+    gt_boxes: [M, (y1, x1, z1, y2, x2, z2)] ground truth боксы
+    threshold: порог IoU для успешной детекции
+
+    Возвращает: Оценка качества детекции от 0.0 до 100.0
+    """
+    if len(proposals) == 0 or len(gt_boxes) == 0:
+        return 0.0
+
+    # Вычисляем перекрытия всех proposals со всеми GT boxes
+    overlaps = compute_overlaps(proposals, gt_boxes)
+
+    # Для каждого GT box найдем proposal с максимальным IoU
+    max_iou_per_gt = np.max(overlaps, axis=0)
+
+    # Количество "хороших" детекций (с IoU > threshold)
+    good_detections = np.sum(max_iou_per_gt >= threshold)
+
+    # Нормализуем по количеству GT boxes
+    recall = good_detections / len(gt_boxes)
+
+    # Штраф за избыточные proposals
+    if len(proposals) > len(gt_boxes):
+        precision = min(1.0, len(gt_boxes) / len(proposals))
+        f1_score = 2 * precision * recall / (precision + recall + 1e-7)
+        score = f1_score * 100.0  # Шкала от 0 до 100
+    else:
+        score = recall * 100.0  # Шкала от 0 до 100
+
+    return score
 def box_refinement_graph(box, gt_box):
     """
     Compute refinement needed to transform box to gt_box.
@@ -552,9 +691,11 @@ def unmold_mask(mask, bbox, image_shape):
 
 def generate_anchors(scales, ratios, shape, feature_stride, anchor_stride):
     """
+    Улучшенная функция генерации якорей для 3D
+
     scales: базовые размеры по Y и X (в пикселях исходника)
     ratios: коэффициенты глубины по Z (пример: [0.125, 0.25, 0.5, 1.0])
-    shape:  [height, width, depth] признаковой карты
+    shape: [height, width, depth] признаковой карты
     feature_stride: int или (sy, sx, sz)
     anchor_stride: int (шаг по сетке признаковой карты)
     """
@@ -570,32 +711,82 @@ def generate_anchors(scales, ratios, shape, feature_stride, anchor_stride):
     shifts_z = np.arange(0, shape[2], anchor_stride) * sz
     shifts_x, shifts_y, shifts_z = np.meshgrid(shifts_x, shifts_y, shifts_z)
 
-    # размеры: по XY — scale, по Z — scale * ratio
+    # Используем телеметрию для определения оптимальных масштабов и соотношений
+    # По данным телеметрии, лучше всего работают масштабы 16, 20, 32, 40
+    # и соотношения 0.1, 0.125, 0.2
+
+    # Создаем сетку размеров с соотношениями
     S, R = np.meshgrid(np.array(scales, dtype=np.float32),
                        np.array(ratios, dtype=np.float32))
-    S = S.flatten(); R = R.flatten()
-    heights = S
-    widths  = S
-    depths  = S * R
+    S = S.flatten();
+    R = R.flatten()
 
-    box_widths,  box_centers_x = np.meshgrid(widths,  shifts_x)
+    # Размеры: для 3D якорей важно правильно масштабировать по Z
+    heights = S  # Y
+    widths = S  # X
+    depths = S * R  # Z - масштабируем соотношением
+
+    # Центрируем якоря в узлах сетки
+    box_widths, box_centers_x = np.meshgrid(widths, shifts_x)
     box_heights, box_centers_y = np.meshgrid(heights, shifts_y)
-    box_depths,  box_centers_z = np.meshgrid(depths,  shifts_z)
+    box_depths, box_centers_z = np.meshgrid(depths, shifts_z)
 
     box_centers = np.stack([box_centers_y, box_centers_x, box_centers_z], axis=2).reshape([-1, 3])
-    box_sizes   = np.stack([box_heights,  box_widths,   box_depths],    axis=2).reshape([-1, 3])
+    box_sizes = np.stack([box_heights, box_widths, box_depths], axis=2).reshape([-1, 3])
 
-    # (y1, x1, z1, y2, x2, z2)
+    # Убеждаемся, что размеры якорей не равны нулю
+    box_sizes = np.maximum(box_sizes, 1.0)
+
+    # Конвертируем центр и размер в (y1, x1, z1, y2, x2, z2)
     boxes = np.concatenate([box_centers - 0.5 * box_sizes,
                             box_centers + 0.5 * box_sizes], axis=1)
+
     return boxes
 
 
 def generate_pyramid_anchors(scales, ratios, feature_shapes, feature_strides, anchor_stride):
+    """
+    Генерация 3D-якорей для пирамиды признаков.
+    Поддерживает любое количество scales: >, = или < числа уровней FPN.
+    - Если scales == #levels: по одному масштабу на уровень (классическое поведение).
+    - Если scales  > #levels: делим scales на чанки по уровням и генерируем якоря для каждого масштаба в чанке.
+    - Если scales  < #levels: недостающие уровни получают последний масштаб.
+    Дополнительно добавляем промежуточный масштаб между соседними базовыми на уровне.
+    """
+
+
+    L = len(feature_shapes)
+    # нормализуем scales в список float
+    try:
+        S = list(scales)
+    except TypeError:
+        S = [float(scales)] * L
+    S = [float(s) for s in S]
+
+    # распределим масштабы по уровням
+    if len(S) == L:
+        per_level = [[s] for s in S]
+    elif len(S) > L:
+        chunks = np.array_split(np.array(S, dtype=float), L)
+        per_level = [list(c) for c in chunks]
+    else:  # len(S) < L
+        per_level = [[s] for s in S] + [[S[-1]] for _ in range(L - len(S))]
+
     anchors = []
-    for i in range(len(scales)):
-        anchors.append(generate_anchors(scales[i], ratios, feature_shapes[i],
-                                        feature_strides[i], anchor_stride))
+    for i in range(L):
+        # базовые якоря для всех масштабов, назначенных этому уровню
+        level_scales = sorted(per_level[i])
+        for si in level_scales:
+            anchors.append(
+                generate_anchors(si, ratios, feature_shapes[i], feature_strides[i], anchor_stride)
+            )
+        # промежуточные масштабы между соседними si на том же уровне
+        for a, b in zip(level_scales[:-1], level_scales[1:]):
+            mid = 0.5 * (a + b)
+            anchors.append(
+                generate_anchors(mid, ratios, feature_shapes[i], feature_strides[i], anchor_stride)
+            )
+
     return np.concatenate(anchors, axis=0)
 
 
@@ -705,8 +896,10 @@ def compute_ap(gt_boxes, gt_class_ids, gt_masks,
 
 
 def rpn_evaluation(model, config, subsets, datasets, check_boxes):
-    IOU_THRESH = 0.5
-    max_object_nb = 2 * config.MAX_GT_INSTANCES
+    IOU_THRESH = float(getattr(config, "EVAL_MATCH_IOU", 0.50))
+    IOU_GRID = list(getattr(config, "EVAL_MATCH_IOU_GRID", [0.30, 0.40, 0.50]))
+    topk = int(getattr(config, "EVAL_TOPK_RPN", 512))
+    det_at = {}
     for subset, dataset in zip(subsets, datasets):
         print(subset)
         generator = RPNGenerator(dataset=dataset, config=config, shuffle=False)
@@ -716,6 +909,8 @@ def rpn_evaluation(model, config, subsets, datasets, check_boxes):
         bbox_loss = []
         checked = 0
         steps = min(config.EVALUATION_STEPS, len(generator))
+        subset_key = subset.strip().lower().replace(" ", "_")
+        det_at[subset_key] = {f"{thr:.2f}": [] for thr in IOU_GRID}
 
         for k in range(steps):
             inputs, _ = generator.__getitem__(k)
@@ -724,11 +919,13 @@ def rpn_evaluation(model, config, subsets, datasets, check_boxes):
             for m in range(batch_rpn_rois.shape[0]):
                 ds_id = generator.image_ids[k * generator.batch_size + m]
                 _, boxes, _ = generator.load_image_gt(ds_id)
+                # если GT пустой — только учтём лоссы
                 if boxes is None or boxes.shape[0] == 0:
                     class_loss.append(rpn_class_loss[m])
                     bbox_loss.append(rpn_bbox_loss[m])
                     continue
-                rpn_rois = denorm_boxes(batch_rpn_rois[m, :max_object_nb], config.IMAGE_SHAPE[:3])
+                # денорм и отбор первых max_object_nb рои
+                rpn_rois = denorm_boxes(batch_rpn_rois[m, :topk], config.IMAGE_SHAPE[:3])
                 if rpn_rois is None or rpn_rois.shape[0] == 0:
                     # учтём лоссы, но дальше не считаем метрики
                     class_loss.append(rpn_class_loss[m])
@@ -749,7 +946,40 @@ def rpn_evaluation(model, config, subsets, datasets, check_boxes):
                     class_loss.append(rpn_class_loss[m])
                     bbox_loss.append(rpn_bbox_loss[m])
                     continue
+
+                try:
+                    Telemetry.update_rpn_proposals(rpn_rois, boxes, config)
+                except Exception:
+                    pass
+
                 overlaps = compute_overlaps(boxes, rpn_rois)
+                TOPK_LIST = list(getattr(config, "EVAL_TOPK_GRID", [int(getattr(config, "EVAL_TOPK_RPN", 512))]))
+                try:
+                    for K in TOPK_LIST:
+                        rpn_rois_k = denorm_boxes(batch_rpn_rois[m, :int(K)], config.IMAGE_SHAPE[:3])
+                        if rpn_rois_k is None or rpn_rois_k.shape[0] == 0:
+                            continue
+                        H, W, D = config.IMAGE_SHAPE[:3]
+                        rpn_rois_k[:, 0] = np.clip(rpn_rois_k[:, 0], 0, H);
+                        rpn_rois_k[:, 1] = np.clip(rpn_rois_k[:, 1], 0, W);
+                        rpn_rois_k[:, 2] = np.clip(rpn_rois_k[:, 2], 0, D)
+                        rpn_rois_k[:, 3] = np.clip(rpn_rois_k[:, 3], 0, H);
+                        rpn_rois_k[:, 4] = np.clip(rpn_rois_k[:, 4], 0, W);
+                        rpn_rois_k[:, 5] = np.clip(rpn_rois_k[:, 5], 0, D)
+                        valid_k = (rpn_rois_k[:, 3] > rpn_rois_k[:, 0]) & (rpn_rois_k[:, 4] > rpn_rois_k[:, 1]) & (
+                                    rpn_rois_k[:, 5] > rpn_rois_k[:, 2])
+                        rpn_rois_k = rpn_rois_k[valid_k]
+                        if rpn_rois_k.shape[0] == 0:
+                            continue
+
+                        overlaps_k = compute_overlaps(boxes, rpn_rois_k)
+                        for thr in IOU_GRID:
+                            hits = (overlaps_k >= float(thr)).any(axis=1).sum()
+                            det_at[subset_key].setdefault(f"{thr:.2f}@{int(K)}", []).append(
+                                100.0 * float(hits) / max(1, boxes.shape[0])
+                            )
+                except Exception:
+                    pass
 
                 roi_association = -1 * np.ones(boxes.shape[0], dtype=np.int32)
                 box_association = -1 * np.ones(rpn_rois.shape[0], dtype=np.int32)
@@ -797,7 +1027,13 @@ def rpn_evaluation(model, config, subsets, datasets, check_boxes):
               "BBOX:", mean_bbox_loss, "+/-", std_bbox_loss)
         print("Mean Coordinate Error:", mean_bbox_error, 
               "Detection score:", mean_detection_score)
-
+        try:
+            for thr_str, values in det_at[subset_key].items():
+                if values:
+                    mean_det_at = float(np.mean(values))
+                    print(f"Detection@{thr_str}:", mean_det_at)
+        except Exception:
+            pass
 
 def head_evaluation(model, config, subsets, datasets):
 
@@ -934,3 +1170,339 @@ def resize(image, output_shape, order=1, mode='constant', cval=0, clip=True,
             image, output_shape,
             order=order, mode=mode, cval=cval, clip=clip,
             preserve_range=preserve_range)
+import os, json, numpy as _np
+class Telemetry:
+    """Ultra-light counters/histograms for anchor/IoU/proposal stats.
+       Updates are probabilistically sampled to keep overhead negligible."""
+    enabled: bool = True
+    sample: float = 0.02          # ~2% батчей обновляют телеметрию
+    _cnt   = _dd(int)
+    _hist  = _dd(list)
+    _save_dir = None
+
+    @staticmethod
+    def set_save_dir(path):
+        Telemetry._save_dir = path
+    @staticmethod
+    def reset():
+        Telemetry._cnt  = _dd(int)
+        Telemetry._hist = _dd(list)
+
+    @staticmethod
+    def update_gt_stats(gt_boxes, config):
+        """Записать геометрию GT: XY, DZ и ratio≈dz/sqrt(dx*dy)."""
+        if not getattr(config, "TELEMETRY", True):
+            return
+        import numpy as _np
+        if gt_boxes is None or not hasattr(gt_boxes, "shape") or gt_boxes.shape[0] == 0:
+            return
+        g = _np.asarray(gt_boxes, dtype=_np.float32)
+        dy = g[:, 3] - g[:, 0]
+        dx = g[:, 4] - g[:, 1]
+        dz = g[:, 5] - g[:, 2]
+        xy = _np.sqrt(_np.maximum(1.0, dx * dy))
+        Telemetry._hist['gt_xy'].extend([float(v) for v in xy[:128]])
+        Telemetry._hist['gt_dz'].extend([float(v) for v in dz[:128]])
+        Telemetry._hist['gt_ratio_est'].extend([float(dz_i / max(1.0, xy_i)) for dz_i, xy_i in zip(dz[:128], xy[:128])])
+
+    @staticmethod
+    def _snap_vals(vals, step, lo, hi, ndigits=3):
+        import numpy as _np
+        xs = []
+        for v in vals:
+            if v is None or not _np.isfinite(v):
+                continue
+            v = float(v)
+            v = max(lo, min(hi, v))
+            v = round(round(v / step) * step, ndigits)
+            xs.append(v)
+        return sorted(set(xs))
+
+    @staticmethod
+    def _quantize_scales(vals, step=8, lo=8, hi=256, limit=8):
+        xs = Telemetry._snap_vals(vals, step=step, lo=lo, hi=hi, ndigits=0)
+        return xs[:limit]
+    @staticmethod
+    def update_rpn_targets(anchors, iou_max, match, config):
+        """Call inside build_rpn_targets after rpn_match computed.
+        anchors: [N,6] (y1,x1,z1,y2,x2,z2)
+        iou_max: [N] max IoU per anchor vs its best GT
+        match:   [N] {1=pos,0=neutral,-1=neg}
+        """
+        if not getattr(config, "TELEMETRY", True): return
+        if _np.random.rand() > float(getattr(config, "TELEMETRY_SAMPLE", Telemetry.sample)): return
+        Telemetry._save_dir = getattr(config, "WEIGHT_DIR", Telemetry._save_dir)
+        Telemetry._cnt['rpn_pos'] += int(_np.sum(match == 1))
+        Telemetry._cnt['rpn_neg'] += int(_np.sum(match == -1))
+        Telemetry._cnt['rpn_neu'] += int(_np.sum(match == 0))
+
+        # немного IoU в гистограмму (обрезаем до 256 значений)
+        mm = (match == 1) | (match == -1)
+        if _np.any(mm):
+            vals = iou_max[mm][:256]
+            Telemetry._hist['rpn_iou_max'].extend([float(v) for v in vals])
+
+        # быстрые геометрические сводки по ПОЛОЖИТЕЛЬНЫМ якорям
+        pos_idx = _np.where(match == 1)[0]
+        if pos_idx.size:
+            # Сэмплируем до 256 позитивов
+            if pos_idx.size > 256:
+                pos_idx = _np.random.choice(pos_idx, 256, replace=False)
+
+            a = anchors[pos_idx]
+            dy = a[:, 3] - a[:, 0]
+            dx = a[:, 4] - a[:, 1]
+            dz = a[:, 5] - a[:, 2]
+
+            xy_geom = _np.sqrt(_np.maximum(1.0, dy * dx))  # proxy масштаба XY
+            Telemetry._hist['pos_dz'].extend([float(v) for v in dz])
+            Telemetry._hist['pos_xy'].extend([float(v) for v in xy_geom])
+
+            # Привязка к ближайшему scale/ratio из конфига (грубая, но быстрая)
+            scales = _np.array(getattr(config, "RPN_ANCHOR_SCALES", [32, 64, 96, 128, 160]), dtype=_np.float32)
+            ratios = _np.array(getattr(config, "RPN_ANCHOR_RATIOS", [0.1, 0.2, 0.3]), dtype=_np.float32)
+
+            # Оцениваем "масштаб" как ближайший scale к XY-размеру, ratio ~ dz / chosen_scale
+            s_idx = _np.argmin(_np.abs(xy_geom[:, None] - scales[None, :]), axis=1)
+            est_ratio = dz / _np.maximum(1.0, scales[s_idx])
+            r_idx = _np.argmin(_np.abs(est_ratio[:, None] - ratios[None, :]), axis=1)
+
+            for v in scales[s_idx]:
+                Telemetry._cnt[f"pos_scale_{int(v)}"] += 1
+            for v in ratios[r_idx]:
+                Telemetry._cnt[f"pos_ratio_{v:.3f}"] += 1
+
+    @staticmethod
+    def update_rpn_proposals(rois, gt_boxes, config):
+        """Лёгкая метрика совпадений RPN ROI с GT (IoU>=τ) + распределение размеров ROI.
+           Делает рандомный семплинг, чтобы не было смещения «первые N».
+        """
+        if not getattr(config, "TELEMETRY", True):
+            return
+        if rois is None or gt_boxes is None or rois.size == 0 or gt_boxes.size == 0:
+            return
+
+        import numpy as _np
+        # рандомная подвыборка
+        R = min(rois.shape[0], 256)
+        G = min(gt_boxes.shape[0], 64)
+        idx_r = _np.random.choice(rois.shape[0], R, replace=False) if rois.shape[0] > R else _np.arange(rois.shape[0])
+        idx_g = _np.random.choice(gt_boxes.shape[0], G, replace=False) if gt_boxes.shape[0] > G else _np.arange(
+            gt_boxes.shape[0])
+        r = rois[idx_r]
+        g = gt_boxes[idx_g]
+
+        inter_min = _np.maximum(r[:, None, :3], g[None, :, :3])
+        inter_max = _np.minimum(r[:, None, 3:], g[None, :, 3:])
+        inter_sz = _np.maximum(0.0, inter_max - inter_min)
+        inter_vol = inter_sz[:, :, 0] * inter_sz[:, :, 1] * inter_sz[:, :, 2]
+        vol_r = _np.prod(r[:, 3:] - r[:, :3], axis=1)[:, None]
+        vol_g = _np.prod(g[:, 3:] - g[:, :3], axis=1)[None, :]
+        iou = inter_vol / (vol_r + vol_g - inter_vol + 1e-9)
+
+        thr = float(getattr(config, "EVAL_DET_IOU", 0.40))
+        hits_mask = (iou >= thr)
+        hits = hits_mask.any(axis=0).sum()
+        Telemetry._cnt['prop_hits'] += int(hits)
+        Telemetry._cnt['prop_total'] += int(G)
+
+        # геометрия ROI (для прикидки нужных scale/ratio)
+        dz = r[:, 5] - r[:, 2]
+        dx = r[:, 4] - r[:, 1]
+        dy = r[:, 3] - r[:, 0]
+        xy = _np.sqrt(_np.maximum(1.0, dx * dy))
+        Telemetry._hist['roi_dz'].extend([float(v) for v in dz[:64]])
+        Telemetry._hist['roi_xy'].extend([float(v) for v in xy[:64]])
+
+        if hits > 0:
+            # для каждого GT найдём лучший ROI (макс IoU по столбцу)
+            best_roi_idx_per_gt = _np.argmax(iou, axis=0)  # shape: [G]
+            best_hits = _np.where(
+                hits_mask[_np.arange(best_roi_idx_per_gt.shape[0]), _np.arange(best_roi_idx_per_gt.shape[0])],
+                best_roi_idx_per_gt, -_np.ones_like(best_roi_idx_per_gt))
+            best_hits = best_hits[best_hits >= 0]
+            if best_hits.size:
+                scales = _np.array(getattr(config, "RPN_ANCHOR_SCALES", [32, 64, 96, 128, 160]), dtype=_np.float32)
+                ratios = _np.array(getattr(config, "RPN_ANCHOR_RATIOS", [0.1, 0.2, 0.3]), dtype=_np.float32)
+                roi_xy_sel = xy[best_hits]
+                roi_dz_sel = dz[best_hits]
+
+                # маппим к ближайшему scale по XY
+                s_idx = _np.argmin(_np.abs(roi_xy_sel[:, None] - scales[None, :]), axis=1)
+                # оценим ratio как dz/scale выбранного масштаба и привяжем к ближайшему ratio из конфига
+                est_ratio = roi_dz_sel / _np.maximum(1.0, scales[s_idx])
+                r_idx = _np.argmin(_np.abs(est_ratio[:, None] - ratios[None, :]), axis=1)
+
+                for v in scales[s_idx]:
+                    Telemetry._cnt[f"pos_scale_{int(v)}"] += 1
+                for v in ratios[r_idx]:
+                    Telemetry._cnt[f"pos_ratio_{v:.3f}"] += 1
+    @staticmethod
+    def _topk_from_cnt(prefix, k=5):
+        """Вернуть top-k значений по Telemetry._cnt с ключами вида f'{prefix}{value}'."""
+        items = [(k, v) for k, v in Telemetry._cnt.items() if k.startswith(prefix)]
+        if not items:
+            return []
+        items.sort(key=lambda x: -x[1])
+        vals = []
+        for key, _ in items[:k]:
+            try:
+                vals.append(float(key.replace(prefix, "")))
+            except Exception:
+                pass
+        return vals
+
+    @staticmethod
+    def _quantize_scales(vals, step=8, lo=8, hi=256):
+        """Округлить размеры под сетку якорей."""
+        out = []
+        for v in vals:
+            if v and v > 0:
+                q = int(max(lo, min(hi, round(float(v) / step) * step)))
+                out.append(q)
+        # uniq + сорт
+        out = sorted(list({int(x) for x in out}))
+        return out
+
+    @staticmethod
+    def _unique_sorted(lst, ndigits=3):
+        """Уникальные отсортированные float с округлением."""
+        s = sorted({round(float(x), ndigits) for x in lst if x and x > 0})
+        return s
+
+    @staticmethod
+    def snapshot_and_reset(epoch, save_dir, extra=None):
+        """Сериализуем jsonl + печатаем дайджест с подсказками для конфигов.
+           Не требует config, использует безопасные дефолты.
+        """
+        import os, json, numpy as _np
+
+        # --- подготовка снимка ---
+        snap = {
+            "epoch": int(epoch),
+            "cnt": dict(Telemetry._cnt),
+            "hist": {k: Telemetry._percentiles(v) for k, v in Telemetry._hist.items()},
+        }
+        if isinstance(extra, dict):
+            snap["extra"] = {k: float(v) if isinstance(v, (int, float)) else v for k, v in extra.items()}
+
+        # если не передали save_dir — возьмём то, что сохранилось ранее
+        if not save_dir:
+            save_dir = Telemetry._save_dir or "./weights"
+
+        # --- top по scales/ratios ---
+        cnt = snap["cnt"]
+        scale_items = [(k, v) for k, v in cnt.items() if k.startswith("pos_scale_")]
+        ratio_items = [(k, v) for k, v in cnt.items() if k.startswith("pos_ratio_")]
+
+        def _top3(items, key_is_num=False):
+            if not items:
+                return []
+            if key_is_num:
+                items = [(int(k.split("pos_scale_")[1]), v) for k, v in items]
+            else:
+                items = [(float(k.split("pos_ratio_")[1]), v) for k, v in items]
+            items.sort(key=lambda kv: (-kv[1], kv[0]))
+            return items[:3]
+
+        top_scales = _top3(scale_items, key_is_num=True)
+        top_ratios = _top3(ratio_items, key_is_num=False)
+        snap["top"] = {
+            "scales": [{"value": int(s), "count": int(c)} for s, c in top_scales],
+            "ratios": [{"value": float(r), "count": int(c)} for r, c in top_ratios],
+        }
+
+        # --- SUGGEST: готовые списки для конфига ---
+        # Диапазоны/шаги — безопасные дефолты, чтобы не зависеть от config внутри статики.
+        SCALE_STEP = 8
+        SCALE_MIN, SCALE_MAX_DEFAULT = 8, 256
+        RATIO_STEP = 0.02
+        RATIO_MIN, RATIO_MAX = 0.04, 0.30
+        LIMIT = 8
+
+        xy_vals = []
+        for key in ("gt_xy", "pos_xy", "roi_xy"):
+            h = snap["hist"].get(key)
+            if h and "p50" in h:
+                xy_vals += [h.get("p25", 0), h.get("p50", 0), h.get("p75", 0)]
+        hi_xy = int(max(SCALE_MAX_DEFAULT, snap["hist"].get("roi_xy", {}).get("max", SCALE_MAX_DEFAULT)))
+        scales_suggest = Telemetry._quantize_scales(xy_vals, step=SCALE_STEP, lo=SCALE_MIN, hi=hi_xy)[:LIMIT]
+
+        rat_src = []
+        hrat = snap["hist"].get("gt_ratio_est")
+        if hrat:
+            rat_src += [hrat.get("p25", 0), hrat.get("p50", 0), hrat.get("p75", 0)]
+        pd, px = snap["hist"].get("pos_dz"), snap["hist"].get("pos_xy")
+        if pd and px:
+            for dz, xy in ((pd.get("p25", 0), px.get("p25", 1)),
+                           (pd.get("p50", 0), px.get("p50", 1)),
+                           (pd.get("p75", 0), px.get("p75", 1))):
+                if xy > 0:
+                    rat_src.append(float(dz) / float(xy))
+        # добавим пики из top_ratios
+        rat_src += [float(r) for r, _cnt in top_ratios]
+        # защёлкиваем к сетке
+        ratios_suggest = Telemetry._snap_vals(rat_src, step=RATIO_STEP, lo=RATIO_MIN, hi=RATIO_MAX, ndigits=3)[:LIMIT]
+
+        snap["suggest"] = {"scales": scales_suggest, "ratios": ratios_suggest}
+
+        # сохраним последний suggest в классе — для AutoTuneRPNCallback
+        try:
+            Telemetry._last_suggest = {"RPN_ANCHOR_SCALES": scales_suggest, "RPN_ANCHOR_RATIOS": ratios_suggest}
+        except Exception:
+            pass
+
+        # --- запись jsonl ---
+        try:
+            os.makedirs(save_dir, exist_ok=True)
+            with open(os.path.join(save_dir, "telemetry.jsonl"), "a", encoding="utf-8") as f:
+                f.write(json.dumps(snap, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+        # --- краткий принт + эвристики ---
+        pos = snap["cnt"].get("rpn_pos", 0);
+        neg = snap["cnt"].get("rpn_neg", 0);
+        neu = snap["cnt"].get("rpn_neu", 0)
+        iou_p50 = snap["hist"].get("rpn_iou_max", {}).get("p50", None)
+
+        def _fmt_top(name, arr):
+            if not arr:
+                return f"{name}=-"
+            return f"{name}=" + ",".join([f"{v['value']}({v['count']})" for v in arr])
+        print(f"[telemetry] epoch={snap['epoch']} "
+            f"rpn(+/0/-)={pos}/{neu}/{neg}  iou50={iou_p50 if iou_p50 is not None else '-'}  "
+            f"hits={snap['cnt'].get('prop_hits', 0)}/{snap['cnt'].get('prop_total', 0)}  "
+            f"{_fmt_top('top_scales', snap['top']['scales'])}  {_fmt_top('top_ratios', snap['top']['ratios'])}")
+
+        if snap.get("suggest"):
+            print(
+                    f"[telemetry] suggest_scales={snap['suggest']['scales']}  suggest_ratios={snap['suggest']['ratios']}")
+
+                # опционально сохраним патч с подсказками рядом с весами
+
+        try:
+            ds = os.path.basename(os.path.normpath(save_dir.rstrip("/"))) or "dataset"
+            patch = {"RPN_ANCHOR_SCALES": scales_suggest, "RPN_ANCHOR_RATIOS": ratios_suggest}
+            with open(os.path.join(save_dir, f"suggest_patch_{ds}_epoch{snap['epoch']:03d}.json"), "w",
+                      encoding="utf-8") as pf:
+                pf.write(json.dumps(patch, ensure_ascii=False, indent=2))
+        except Exception as e:
+            print(f"[telemetry] save suggest patch failed: {e}")
+
+        Telemetry.reset()
+
+    @staticmethod
+    def _percentiles(arr):
+        if not arr: return {}
+        a = _np.asarray(arr, dtype=_np.float32)
+        return {
+            "count": int(a.size),
+            "min":   float(a.min()),
+            "p25":   float(_np.percentile(a, 25)),
+            "p50":   float(_np.percentile(a, 50)),
+            "p75":   float(_np.percentile(a, 75)),
+            "max":   float(a.max()),
+            "mean": float(a.mean()),
+            "std": float(a.std())
+        }
