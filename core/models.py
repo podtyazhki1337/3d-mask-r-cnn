@@ -1641,41 +1641,38 @@ class HeadEvaluationCallback(keras.callbacks.Callback):
 
     def _eval_subset(self, dataset, subset_name: str):
         import numpy as np, time
-
-        # ===== ЛОКАЛЬНЫЕ КОНСТАНТЫ (меняются только здесь, конфиг не трогаем) =====
-        T = int(getattr(self.config, "TRAIN_ROIS_PER_IMAGE", 128))  # размер чанка (как и прежде)
-        MAX_IMGS = 64  # максимум изображений в оценке (равномерный сабсэмпл по датасету)
-        MAX_CHUNKS_PER_IMG = 2  # максимум чанков на изображение
-        POS_CHUNK_BIAS = 0.7  # доля «позитивных» чанков среди выбранных
-        COMPUTE_STD = False  # считать ли STD по чанкам (дороже). Оставь False для скорости.
-        TIME_BUDGET_SEC = 0  # жёсткий тайм-бюджет на весь subset (в секундах). 0 = без лимита.
+        # ===== ЛОКАЛЬНЫЕ КОНСТАНТЫ =====
+        T = int(getattr(self.config, "TRAIN_ROIS_PER_IMAGE", 128))
+        MAX_IMGS = 64
+        MAX_CHUNKS_PER_IMG = 2
+        POS_CHUNK_BIAS = 0.7
+        COMPUTE_STD = False
+        TIME_BUDGET_SEC = 0
 
         # ===== подготовка источника данных =====
         gen = HeadGenerator(dataset=dataset, config=self.config, shuffle=False, training=False)
 
-        # равномерный сабсэмпл image_ids (без случайности — повторяемо)
         img_ids = list(dataset.image_ids)
         if isinstance(MAX_IMGS, int) and MAX_IMGS > 0 and len(img_ids) > MAX_IMGS:
             idx = np.linspace(0, len(img_ids) - 1, num=MAX_IMGS, dtype=np.int32)
             img_ids = [int(img_ids[i]) for i in idx]
 
-        # ===== берём только выходы loss-слоёв (меньше данных тянуть из графа) =====
+        # ===== берём только выходы loss-слоёв =====
         loss_layers, loss_order = [], []
-        for lname in self._present_losses:  # имена слоёв уже собраны в __init__
+        for lname in self._present_losses:
             try:
                 loss_layers.append(self.model.get_layer(lname).output)
                 loss_order.append(lname)
             except Exception:
                 pass
         if not loss_layers:
-            # fallback на predict_on_batch по всей модели (не должен понадобиться)
             loss_order = list(self._present_losses)
             loss_layers = [self.model.outputs[self._name_to_idx[l]] for l in loss_order]
 
         try:
             loss_fn = K.function(self.model.inputs, loss_layers)
         except Exception:
-            loss_fn = None  # безопасный откат на self.model.predict_on_batch
+            loss_fn = None
 
         # ===== аккумулируем взвешенные суммы =====
         sum_by_loss = {n: 0.0 for n in loss_order}
@@ -1688,7 +1685,6 @@ class HeadEvaluationCallback(keras.callbacks.Callback):
         t0 = time.time()
         prev_lp = None
         try:
-            # один раз фиксируем inference-режим
             try:
                 prev_lp = K.learning_phase()
             except Exception:
@@ -1700,7 +1696,6 @@ class HeadEvaluationCallback(keras.callbacks.Callback):
 
             # ===== основной цикл =====
             for image_id in img_ids:
-                # тайм-бюджет
                 if TIME_BUDGET_SEC and (time.time() - t0) > TIME_BUDGET_SEC:
                     break
 
@@ -1711,12 +1706,8 @@ class HeadEvaluationCallback(keras.callbacks.Callback):
                 if total == 0:
                     continue
 
-                roi_total += total
-                pos_total += int((target_class_ids > 0).sum())
-
                 # разбиение на чанки
                 num_chunks = (total + T - 1) // T
-                # считаем «полезность» чанков (есть ли позитивы), и знаменатели
                 pos_mask_list = []
                 n_roi_vec = np.empty((num_chunks,), dtype=np.int32)
                 n_pos_vec = np.empty((num_chunks,), dtype=np.int32)
@@ -1729,7 +1720,7 @@ class HeadEvaluationCallback(keras.callbacks.Callback):
                     n_pos_vec[ci] = n_pos
                     pos_mask_list.append(n_pos > 0)
 
-                # выбираем ограниченное число чанков: сначала позитивные, потом добираем негативные
+                # выбираем ограниченное число чанков
                 if isinstance(MAX_CHUNKS_PER_IMG, int) and MAX_CHUNKS_PER_IMG > 0 and num_chunks > MAX_CHUNKS_PER_IMG:
                     pos_idx = [i for i, f in enumerate(pos_mask_list) if f]
                     neg_idx = [i for i, f in enumerate(pos_mask_list) if not f]
@@ -1744,12 +1735,19 @@ class HeadEvaluationCallback(keras.callbacks.Callback):
                 if B == 0:
                     continue
 
-                # соберём один батч на изображение (B чанков)
-                ra_b = np.zeros((B, T,) + rois_aligned.shape[1:], dtype=rois_aligned.dtype)
-                ma_b = np.zeros((B, T,) + mask_aligned.shape[1:], dtype=mask_aligned.dtype)
-                tci_b = np.zeros((B, T), dtype=target_class_ids.dtype)
-                tb_b = np.zeros((B, T, 6), dtype=target_bbox.dtype)
-                tm_b = np.zeros((B, T,) + target_mask.shape[1:] + (1,), dtype=target_mask.dtype)
+                # --- батч на изображение (B чанков) ---
+                ra_b = np.zeros((B, T,) + rois_aligned.shape[1:], dtype=np.float32)
+                ma_b = np.zeros((B, T,) + mask_aligned.shape[1:], dtype=np.float32)
+                tci_b = np.full((B, T), -1, dtype=np.int32)
+                tb_b = np.zeros((B, T, 6), dtype=np.float32)
+
+                # ВАЖНО: не удваивать канал, если он уже есть
+                if target_mask.ndim == 5 and target_mask.shape[-1] == 1:
+                    tm_tail = target_mask.shape[1:]  # (28,28,28,1)
+                else:
+                    tm_tail = target_mask.shape[1:] + (1,)  # (28,28,28,1) из (28,28,28)
+                tm_b = np.zeros((B, T) + tm_tail, dtype=np.float32)
+
                 im_b = np.repeat(image_meta[np.newaxis, ...], B, axis=0)
 
                 n_roi_sel = np.empty((B,), dtype=np.int32)
@@ -1765,28 +1763,37 @@ class HeadEvaluationCallback(keras.callbacks.Callback):
                     tb = target_bbox[start:end]
                     tm = target_mask[start:end]
 
-                    n_roi = ra.shape[0];
+                    n_roi = ra.shape[0]
                     n_pos = int((tci > 0).sum())
-                    n_roi_sel[bi] = n_roi;
+                    n_roi_sel[bi] = n_roi
                     n_pos_sel[bi] = n_pos
 
                     ra_b[bi, :n_roi] = ra
                     ma_b[bi, :n_roi] = ma
                     tci_b[bi, :n_roi] = tci
                     tb_b[bi, :n_roi] = tb
-                    tm_b[bi, :n_roi, ..., np.newaxis] = tm[..., np.newaxis]
+
+                    # Добавляем канал только если его нет
+                    if tm.ndim == 4:
+                        tm = tm[..., np.newaxis]
+                    # страховки форм
+                    assert tm.shape[-1] == 1 and tm.shape[0] == n_roi, f"target_mask shape mismatch: {tm.shape}"
+                    tm_b[bi, :n_roi] = tm.astype(np.float32)
+
+                # POS/RATE считаем по выбранным чанкам
+                roi_total += int(n_roi_sel.sum())
+                pos_total += int(n_pos_sel.sum())
 
                 inputs_b = [ra_b, ma_b, im_b, tci_b, tb_b, tm_b]
                 if loss_fn is not None:
                     outs = loss_fn(inputs_b)
                 else:
-                    # редкий fallback
                     full = self.model.predict_on_batch(inputs_b)
                     outs = [np.asarray(full[self._name_to_idx[l]]) for l in loss_order]
 
-                # аккумулируем взвешенные суммы (bbox/mask — по числу позитивов, остальное — по числу ROI)
+                # аккумулируем взвешенные суммы
                 for lidx, lname in enumerate(loss_order):
-                    vals = np.asarray(outs[lidx]).reshape(-1)  # (B,)
+                    vals = np.asarray(outs[lidx]).reshape(B, -1).mean(axis=1)  # приводим к (B,)
                     denom = n_pos_sel if (("bbox" in lname) or ("mask" in lname)) else n_roi_sel
                     valid = denom > 0
                     if np.any(valid):
@@ -1799,7 +1806,6 @@ class HeadEvaluationCallback(keras.callbacks.Callback):
                 used_chunks_total += int(B)
 
         finally:
-            # вернуть learning_phase
             try:
                 if prev_lp is not None:
                     K.set_learning_phase(prev_lp)
@@ -1820,18 +1826,15 @@ class HeadEvaluationCallback(keras.callbacks.Callback):
             if COMPUTE_STD:
                 stats[f"head_{subset_name}_{short}_std"] = std
 
-        # взвешенная сумма по LOSS_WEIGHTS
         total = 0.0
         for lname in loss_order:
             mean = stats[f"head_{subset_name}_{lname.replace('mrcnn_', '').replace('_loss', '')}_mean"]
             total += mean * self._lw.get(lname, 1.0)
         stats[f"head_{subset_name}_total_loss"] = total
 
-        # POS_RATE на оцененной подвыборке
         pos_rate = float(pos_total) / max(int(roi_total), 1)
         stats[f"head_{subset_name}_pos_rate"] = pos_rate
 
-        # печать (без STD — быстро)
         tag = "TRAIN SUBSET" if subset_name == "train" else "TEST SUBSET"
         parts = []
         for lname in ["mrcnn_class_loss", "mrcnn_bbox_loss", "mrcnn_mask_loss", "mrcnn_obj_loss", "mrcnn_margin_loss"]:
