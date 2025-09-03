@@ -1644,8 +1644,8 @@ class HeadEvaluationCallback(keras.callbacks.Callback):
 
         # ===== ЛОКАЛЬНЫЕ КОНСТАНТЫ =====
         T = int(getattr(self.config, "TRAIN_ROIS_PER_IMAGE", 128))
-        MAX_IMGS = 64
-        MAX_CHUNKS_PER_IMG = 2
+        MAX_IMGS = 12
+        MAX_CHUNKS_PER_IMG = 4
         POS_CHUNK_BIAS = 0.7
         COMPUTE_STD = False
         TIME_BUDGET_SEC = 0
