@@ -167,95 +167,151 @@ def jitter_boxes_3d(boxes, count=3, scale_sigma=0.10, trans=(2, 2, 1),
 ############################################################
 
 class HeadGenerator(keras.utils.Sequence):
+    """
+    Генератор для обучения/оценки HEAD.
+    - TRAIN (training=True): жёсткая балансировка из всего пула ROI картинки:
+        ~HEAD_POS_FRAC позитивов в каждом батче (с повторением при нехватке fg/bg).
+        HEAD_SHUFFLE_ROIS влияет только на финальную перетасовку индексов батча.
+    - EVAL (training=False): без балансировки. Идём по картинке чанками (T), чтобы
+        равномерно покрыть все ROI между вызовами (__getitem__ выбирает chunk по _call_count).
+    """
+
     def __init__(self, dataset, config, shuffle=True, training=True):
         self.image_ids = np.copy(dataset.image_ids)
         self.dataset = dataset
         self.config = config
         self.shuffle = shuffle
         self.training = training
-        self.batch_size = self.config.BATCH_SIZE  # держим 1 для предсказуемости VRAM
+        self.batch_size = int(getattr(self.config, "BATCH_SIZE", 1))  # держим 1 для предсказуемости VRAM
         self._debug_calls = 0
         self._call_count = 0  # глобальный счётчик вызовов (для циклического перебора чанков)
 
     def __len__(self):
-        # один image_id => один шаг (чанкуем внутри data_generator)
+        # один image_id => один шаг (чанкуем/балансируем внутри __getitem__)
         return int(np.ceil(len(self.image_ids) / float(self.batch_size)))
 
     def __getitem__(self, idx):
         import numpy as np
 
+        # Предполагаем batch_size == 1 (как согласовано); берём один image_id
         image_id = int(self.image_ids[idx])
+
         rois_aligned, mask_aligned, image_meta, target_class_ids, target_bbox, target_mask = \
             self.load_image_gt(image_id)
+
+        # Приведём типы к float32 / int32 для стабильности
+        rois_aligned  = rois_aligned.astype(np.float32, copy=False)
+        mask_aligned  = mask_aligned.astype(np.float32, copy=False)
+        image_meta    = image_meta.astype(np.float32,   copy=False)
+        target_bbox   = target_bbox.astype(np.float32,  copy=False)
+        target_class_ids = target_class_ids.astype(np.int32, copy=False)
+        # target_mask оставим как есть; канал добавим ниже при формировании inputs
 
         T = int(getattr(self.config, "TRAIN_ROIS_PER_IMAGE", 128))
         total = int(rois_aligned.shape[0])
 
-        # базовый порядок и перемешивание
+        # Базовый порядок
         order = np.arange(total, dtype=np.int32)
         if self.training and bool(getattr(self.config, "HEAD_SHUFFLE_ROIS", True)):
             np.random.shuffle(order)
 
-        # индексы fg/bg
+        # Индексы fg/bg
         pos_idx = order[target_class_ids[order] > 0]
         neg_idx = order[target_class_ids[order] <= 0]
 
-        # номер чанка по изображению
-        num_chunks = int(np.ceil(total / float(T)))
+        # Номер чанка (для EVAL-ветки)
+        num_chunks = int(np.ceil(total / float(T))) if T > 0 else 1
         chunk_id = self._call_count % max(1, num_chunks)
         self._call_count += 1
 
-        # простая балансировка: доля позитивов в чанке
+        # Настройки балансировки
         use_balance = self.training and bool(getattr(self.config, "HEAD_BALANCE_POS", True))
         pos_frac = float(getattr(self.config, "HEAD_POS_FRAC", 0.25))
+        if not np.isfinite(pos_frac):
+            pos_frac = 0.25
+        pos_frac = float(min(max(pos_frac, 0.0), 1.0))
 
-        if use_balance and pos_idx.size > 0:
-            n_pos = max(1, min(int(round(T * pos_frac)), pos_idx.size))
+        if use_balance:
+            # Жёсткая балансировка из всего пула ROI картинки
+            # Сколько позитивов хотим
+            want_pos = int(round(T * pos_frac))
+            if pos_idx.size > 0:
+                n_pos = max(1, min(want_pos, pos_idx.size)) if want_pos > 0 else 1
+                take_pos = np.random.choice(pos_idx, size=n_pos, replace=(pos_idx.size < n_pos))
+            else:
+                # Если вообще нет fg — пустой набор
+                n_pos = 0
+                take_pos = np.array([], dtype=np.int32)
+
+            # Сколько негативов добираем
             n_neg = max(T - n_pos, 0)
-            take_pos = np.random.choice(pos_idx, size=n_pos, replace=(pos_idx.size < n_pos))
-            base_neg = neg_idx if neg_idx.size > 0 else order
-            take_neg = np.random.choice(base_neg, size=n_neg, replace=True)
-            idxs = np.concatenate([take_pos, take_neg])
-            np.random.shuffle(idxs)
+            if neg_idx.size > 0:
+                take_neg = np.random.choice(neg_idx, size=n_neg, replace=(neg_idx.size < n_neg))
+            else:
+                # Экзотика: нет bg — добираем из pos с повторением (получится "всё fg")
+                base = pos_idx if pos_idx.size > 0 else order
+                take_neg = np.random.choice(base, size=n_neg, replace=True)
+
+            idxs = np.concatenate([take_pos, take_neg], axis=0)
+            # Финальная перемешка батча (если включено)
+            if bool(getattr(self.config, "HEAD_SHUFFLE_ROIS", True)):
+                np.random.shuffle(idxs)
+
+            # Паддинг до T (на всякий случай)
+            if idxs.shape[0] < T:
+                pad_src = neg_idx if neg_idx.size > 0 else (pos_idx if pos_idx.size > 0 else order)
+                pad = T - idxs.shape[0]
+                pad_ids = np.random.choice(pad_src, size=pad, replace=True)
+                idxs = np.concatenate([idxs, pad_ids], axis=0)
+
+            # Диагностический лог раз в 100 шагов
+            # if (self._debug_calls % 100) == 0:
+            #     pos_in = int(np.sum(target_class_ids[idxs] > 0))
+            #     print(f"[HEAD.train] balanced pos_in_batch = {pos_in}/{T}", flush=True)
+            # self._debug_calls += 1
+
         else:
+            # EVAL (или TRAIN без балансировки): берём последовательный чанк
             start = chunk_id * T
             end = min(start + T, total)
             idxs = order[start:end]
+            # Паддинг до T (берём bg или что есть)
+            if idxs.shape[0] < T:
+                pad_src = neg_idx if neg_idx.size > 0 else (pos_idx if pos_idx.size > 0 else order)
+                pad = T - idxs.shape[0]
+                pad_ids = np.random.choice(pad_src, size=pad, replace=True)
+                idxs = np.concatenate([idxs, pad_ids], axis=0)
 
-        # паддинг до T
-        pad = T - idxs.shape[0]
-        if pad > 0:
-            pad_src = neg_idx if neg_idx.size > 0 else order
-            pad_ids = np.random.choice(pad_src, size=pad, replace=True)
-            idxs = np.concatenate([idxs, pad_ids], axis=0)
+            # Диагностический лог (можно включить)
+            # pos_in = int(np.sum(target_class_ids[idxs] > 0))
+            # print(f"[HeadGenerator] image_id={image_id} chunk {chunk_id + 1}/{num_chunks} (T={T}) "
+            #       f"pos_in_chunk={pos_in}/{T}", flush=True)
 
-        # собрать чанковый батч
-        ra = rois_aligned[idxs]
-        ma = mask_aligned[idxs]
-        tci = target_class_ids[idxs]
-        tb = target_bbox[idxs]
-        tm = target_mask[idxs]
+        # Собираем батч по выбранным индексам
+        ra = rois_aligned[idxs]          # (T, 7,7,7,C)
+        ma = mask_aligned[idxs]          # (T,14,14,14,C)
+        tci = target_class_ids[idxs]     # (T,)
+        tb  = target_bbox[idxs]          # (T,6)
+        tm  = target_mask[idxs]          # (T,28,28,28) или (T,28,28,28,1)
 
-        # лёгкая фича-аугментация при обучении (оставь как у тебя, если есть)
+        # Лёгкая фича-аугментация при обучении (если есть реализация)
         if self.training and hasattr(self, "_augment_head_features"):
             ra, ma, tm = self._augment_head_features(ra, ma, tm)
 
-        # batch axis
-        inputs = [
-            ra[np.newaxis, ...],
-            ma[np.newaxis, ...],
-            image_meta[np.newaxis, ...],
-            tci[np.newaxis, ...],
-            tb[np.newaxis, ...],
-            tm[np.newaxis, ..., np.newaxis],
-        ]
-        outputs = []
+        # Формируем inputs с batch-осью и каналом для маски
+        if tm.ndim == 4:
+            tm = tm[..., np.newaxis]  # -> (T,28,28,28,1)
 
-        # явный лог (первые 3 вызова)
-        self._debug_calls += 1
-        if self._debug_calls <= 3:
-            print(f"[HeadGenerator] image_id={image_id} chunk {chunk_id + 1}/{num_chunks} "
-                  f"(T={T}) pos_in_chunk={(tci > 0).sum()}/{T}", flush=True)
+        inputs = [
+            ra[np.newaxis, ...],                # (1,T,7,7,7,C)   float32
+            ma[np.newaxis, ...],                # (1,T,14,14,14,C) float32
+            image_meta[np.newaxis, ...],        # (1, meta)      float32
+            tci[np.newaxis, ...],               # (1,T)          int32
+            tb[np.newaxis, ...],                # (1,T,6)        float32
+            tm[np.newaxis, ...],                # (1,T,28,28,28,1) float32/uint8 -> выше неявно float32, если аугментация
+        ]
+        outputs = []  # лоссы считаем из внутренних loss-слоёв
+
         return inputs, outputs
 
     def _augment_head_features(self, rois_aligned, mask_aligned, target_mask):

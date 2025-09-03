@@ -6,7 +6,7 @@
     "IMAGE_CHANNEL_COUNT": 1,
     "MAX_GT_INSTANCES": 25,
     "USE_MINI_MASK": false,
-    "TARGET_RATIO": 0.2,
+    "TARGET_RATIO": 0.4,
     "EVALUATION_STEPS": 41,
 
     "MODE": "training",

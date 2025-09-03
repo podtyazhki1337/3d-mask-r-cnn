@@ -1641,6 +1641,7 @@ class HeadEvaluationCallback(keras.callbacks.Callback):
 
     def _eval_subset(self, dataset, subset_name: str):
         import numpy as np, time
+
         # ===== ЛОКАЛЬНЫЕ КОНСТАНТЫ =====
         T = int(getattr(self.config, "TRAIN_ROIS_PER_IMAGE", 128))
         MAX_IMGS = 64
@@ -1669,18 +1670,91 @@ class HeadEvaluationCallback(keras.callbacks.Callback):
             loss_order = list(self._present_losses)
             loss_layers = [self.model.outputs[self._name_to_idx[l]] for l in loss_order]
 
+        # Пытаемся подготовить слой/выход objness для AUC
+        obj_name = "mrcnn_obj"
+        obj_layer = None
         try:
-            loss_fn = K.function(self.model.inputs, loss_layers)
+            obj_layer = self.model.get_layer(obj_name).output
         except Exception:
-            loss_fn = None
+            try:
+                obj_layer = self.model.outputs[self._name_to_idx[obj_name]]
+            except Exception:
+                obj_layer = None
+
+        # Список тензоров, которые попробуем тянуть одной функцией
+        fetch_layers = list(loss_layers)
+        obj_fetch_idx = None
+        if obj_layer is not None:
+            obj_fetch_idx = len(fetch_layers)
+            fetch_layers.append(obj_layer)
+
+        # Функция для инференса выбранных тензоров (если получится)
+        try:
+            fetch_fn = K.function(self.model.inputs, fetch_layers)
+        except Exception:
+            fetch_fn = None  # откатимся на predict_on_batch / отдельный K.function по необходимости
+
+        # ==== безопасная выборка obj-оценок ====
+        def _safe_fetch_obj_scores(model, inputs_b, outs, obj_fetch_idx, obj_name, name_to_idx):
+            # 1) если obj шёл в fetch_layers и вернулся — взять из outs
+            if outs is not None and obj_fetch_idx is not None:
+                if 0 <= obj_fetch_idx < len(outs):
+                    try:
+                        return np.asarray(outs[obj_fetch_idx])
+                    except Exception:
+                        pass
+            # 2) попробовать достать из predict_on_batch по имени выхода
+            try:
+                full = model.predict_on_batch(inputs_b)
+                if obj_name in name_to_idx:
+                    return np.asarray(full[name_to_idx[obj_name]])
+            except Exception:
+                pass
+            # 3) отдельная функция только на obj-слой (если он есть)
+            try:
+                layer = model.get_layer(obj_name)
+                fn = K.function(model.inputs, [layer.output])
+                return np.asarray(fn(inputs_b)[0])
+            except Exception:
+                return None
 
         # ===== аккумулируем взвешенные суммы =====
         sum_by_loss = {n: 0.0 for n in loss_order}
         den_by_loss = {n: 0 for n in loss_order}
         chunk_vals = {n: [] for n in loss_order} if COMPUTE_STD else None
 
+        # Для OBJNESS_AUC собираем по-ROI
+        obj_scores_all, obj_labels_all = [], []
+
         pos_total, roi_total = 0, 0
         used_imgs, used_chunks_total = 0, 0
+
+        # Утилита AUC (Mann–Whitney)
+        def _binary_auc(scores, labels):
+            s = np.asarray(scores, dtype=np.float64)
+            y = np.asarray(labels, dtype=np.int32)
+            if s.size == 0:
+                return np.nan
+            n_pos = int((y == 1).sum())
+            n_neg = int((y == 0).sum())
+            if n_pos == 0 or n_neg == 0:
+                return np.nan
+            order = np.argsort(s)
+            s_sorted = s[order]
+            y_sorted = y[order]
+            ranks = np.empty_like(s_sorted, dtype=np.float64)
+            n = s_sorted.size
+            i = 0
+            while i < n:
+                j = i + 1
+                while j < n and s_sorted[j] == s_sorted[i]:
+                    j += 1
+                r = 0.5 * ((i + 1) + j)  # средний ранг при тай-нах
+                ranks[i:j] = r
+                i = j
+            sum_ranks_pos = ranks[y_sorted == 1].sum()
+            auc = (sum_ranks_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+            return float(auc)
 
         t0 = time.time()
         prev_lp = None
@@ -1741,7 +1815,6 @@ class HeadEvaluationCallback(keras.callbacks.Callback):
                 tci_b = np.full((B, T), -1, dtype=np.int32)
                 tb_b = np.zeros((B, T, 6), dtype=np.float32)
 
-                # ВАЖНО: не удваивать канал, если он уже есть
                 if target_mask.ndim == 5 and target_mask.shape[-1] == 1:
                     tm_tail = target_mask.shape[1:]  # (28,28,28,1)
                 else:
@@ -1773,11 +1846,8 @@ class HeadEvaluationCallback(keras.callbacks.Callback):
                     tci_b[bi, :n_roi] = tci
                     tb_b[bi, :n_roi] = tb
 
-                    # Добавляем канал только если его нет
                     if tm.ndim == 4:
                         tm = tm[..., np.newaxis]
-                    # страховки форм
-                    assert tm.shape[-1] == 1 and tm.shape[0] == n_roi, f"target_mask shape mismatch: {tm.shape}"
                     tm_b[bi, :n_roi] = tm.astype(np.float32)
 
                 # POS/RATE считаем по выбранным чанкам
@@ -1785,15 +1855,36 @@ class HeadEvaluationCallback(keras.callbacks.Callback):
                 pos_total += int(n_pos_sel.sum())
 
                 inputs_b = [ra_b, ma_b, im_b, tci_b, tb_b, tm_b]
-                if loss_fn is not None:
-                    outs = loss_fn(inputs_b)
-                else:
+
+                # тянем выбранные тензоры
+                outs = None
+                if fetch_fn is not None:
+                    try:
+                        outs = fetch_fn(inputs_b)
+                    except Exception:
+                        outs = None
+
+                # если не удалось — fallback на predict_on_batch для лоссов
+                if outs is None:
                     full = self.model.predict_on_batch(inputs_b)
                     outs = [np.asarray(full[self._name_to_idx[l]]) for l in loss_order]
 
-                # аккумулируем взвешенные суммы
+                # аккумулируем лоссы
                 for lidx, lname in enumerate(loss_order):
-                    vals = np.asarray(outs[lidx]).reshape(B, -1).mean(axis=1)  # приводим к (B,)
+                    arr = np.asarray(outs[lidx])
+                    if arr.ndim == 0 or arr.size == 1:
+                        vals = np.full((B,), float(arr), dtype=np.float32)
+                    else:
+                        arr = arr.astype(np.float32, copy=False)
+                        if arr.shape[0] != B:
+                            try:
+                                arr = arr.reshape(B, -1)
+                            except Exception:
+                                arr = np.broadcast_to(arr.reshape(1, -1), (B, -1))
+                        else:
+                            arr = arr.reshape(B, -1)
+                        vals = arr.mean(axis=1)
+
                     denom = n_pos_sel if (("bbox" in lname) or ("mask" in lname)) else n_roi_sel
                     valid = denom > 0
                     if np.any(valid):
@@ -1801,6 +1892,23 @@ class HeadEvaluationCallback(keras.callbacks.Callback):
                         den_by_loss[lname] += int(denom[valid].sum())
                     if COMPUTE_STD and chunk_vals is not None:
                         chunk_vals[lname].extend(vals.tolist())
+
+                # собираем objness для AUC безопасно
+                obj = _safe_fetch_obj_scores(self.model, inputs_b, outs, obj_fetch_idx, obj_name, self._name_to_idx)
+                if obj is not None:
+                    obj = np.asarray(obj)
+                    # ожидаем (B,T,1) или (B,T); приведём к (B,T,1)
+                    if obj.ndim == 2:
+                        obj = obj[..., np.newaxis]
+                    if obj.ndim == 3 and obj.shape[0] == B:
+                        for bi in range(B):
+                            n = int(n_roi_sel[bi])
+                            if n <= 0:
+                                continue
+                            scores = obj[bi, :n, 0]
+                            labels = (tci_b[bi, :n] > 0).astype(np.int32)
+                            obj_scores_all.append(scores)
+                            obj_labels_all.append(labels)
 
                 used_imgs += 1
                 used_chunks_total += int(B)
@@ -1835,6 +1943,15 @@ class HeadEvaluationCallback(keras.callbacks.Callback):
         pos_rate = float(pos_total) / max(int(roi_total), 1)
         stats[f"head_{subset_name}_pos_rate"] = pos_rate
 
+        # ==== OBJNESS_AUC ====
+        if len(obj_scores_all) > 0 and len(obj_labels_all) > 0:
+            s = np.concatenate(obj_scores_all, axis=0)
+            y = np.concatenate(obj_labels_all, axis=0)
+            auc = _binary_auc(s, y)
+        else:
+            auc = np.nan
+        stats[f"head_{subset_name}_obj_auc"] = float(auc) if np.isfinite(auc) else np.nan
+
         tag = "TRAIN SUBSET" if subset_name == "train" else "TEST SUBSET"
         parts = []
         for lname in ["mrcnn_class_loss", "mrcnn_bbox_loss", "mrcnn_mask_loss", "mrcnn_obj_loss", "mrcnn_margin_loss"]:
@@ -1842,10 +1959,12 @@ class HeadEvaluationCallback(keras.callbacks.Callback):
                 short = lname.replace("mrcnn_", "").replace("_loss", "").upper()
                 mean = stats[f"head_{subset_name}_{short.lower()}_mean"]
                 parts.append(f"{short}: {mean:.6f}")
+        auc_str = f"OBJ_AUC: {auc:.3f}" if np.isfinite(auc) else "OBJ_AUC: n/a"
+
         print(tag)
         if parts:
             print("    " + "    ".join(parts))
-        print(f"TOTAL(w): {total:.6f}    POS_RATE: {pos_rate:.3f}    "
+        print(f"TOTAL(w): {total:.6f}    POS_RATE: {pos_rate:.3f}    {auc_str}    "
               f"[used {used_imgs}/{len(img_ids)} imgs, {used_chunks_total} chunks, "
               f"time {int(time.time() - t0)}s]")
         return stats
