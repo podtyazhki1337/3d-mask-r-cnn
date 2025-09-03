@@ -1,6 +1,6 @@
 <h1 align="center"> 3D Mask R-CNN </h1>
-Modified version of the Mask R-CNN for 3D image data (volumes). Now it is supports different image depths, gives telemetry during training and evaluation of RPN, and has a more flexible configuration system.
-Also added support for chunked data loading and training for head training and evaluation.
+Modified version of the Mask R-CNN for 3D image data (volumes). Now it is supports depth different from the image size, gives telemetry during training and evaluation of RPN, and has a more flexible configuration system.
+Also added support for chunked data loading and training for Head training and evaluation and some more parameters for evaluation.
 Also contains preprocessing script for the datasets used for my trainings.
 
 Commands for using the Docker image on the datasets (Rats-neurons and Hela Kyoto cells):
