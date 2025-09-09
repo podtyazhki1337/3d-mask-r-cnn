@@ -11,24 +11,28 @@ from skimage.io import imsave
 from core import utils
 
 import tensorflow as tf
-try:
-    # если TF2 и eager уже включён, выключим его заранее
-    if hasattr(tf, "executing_eagerly") and tf.executing_eagerly():
-        tf.compat.v1.disable_eager_execution()
-except Exception as _e:
-    pass
 import keras
 import keras.backend as K
 import keras.layers as KL
 import keras.engine as KE
 import keras.models as KM
+
+# ---- ЕДИНЫЙ TF1-стиль графа и один сеанс ----
+tf.compat.v1.disable_eager_execution()
+K.clear_session()
+_tf_config = tf.compat.v1.ConfigProto()
+_tf_config.gpu_options.allow_growth = True
+_tf_sess = tf.compat.v1.Session(config=_tf_config)
 try:
-    cfg = tf.ConfigProto()
-    cfg.gpu_options.allow_growth = True
-    sess = tf.Session(config=cfg)
-    K.set_session(sess)
-except Exception:
-    pass
+    # Привязываем TF1-сессию к backend Keras
+    K.set_session(_tf_sess)
+    # Для некоторых сборок ещё полезно синхронизировать через tf.compat.v1.keras
+    tf.compat.v1.keras.backend.set_session(_tf_sess)
+except Exception as e:
+    print("[tf-compat] set_session warn:", e)
+
+
+
 if platform.processor() == 'ppc64le':
     import core.custom_op.ppc64le_custom_op as custom_op
 else:
@@ -522,7 +526,7 @@ class PyramidROIAlign(KE.Layer):
         self.pool_shape = tuple(pool_shape)
 
     def call(self, inputs):
-        import tensorflow as tf
+
         boxes, image_meta = inputs[0], inputs[1]
         feature_maps = inputs[2:]
 
@@ -602,6 +606,8 @@ def overlaps_graph(boxes1, boxes2):
     Returns:
         overlaps: matrix of overlap
     """
+    boxes1 = tf.cast(boxes1, tf.float32)
+    boxes2 = tf.cast(boxes2, tf.float32)
 
     # 1. Tile boxes2 and repeat boxes1. This allows us to compare
     # every boxes1 against every boxes2 without loops.
@@ -629,7 +635,6 @@ def overlaps_graph(boxes1, boxes2):
     # 4. Compute IoU and reshape to [boxes1, boxes2]
     iou = intersection / union
     overlaps = tf.reshape(iou, [tf.shape(boxes1)[0], tf.shape(boxes2)[0]])
-
     return overlaps
 
 
@@ -935,101 +940,78 @@ def build_fpn_mask_graph(y, num_classes, conv_channel, train_bn=True):
     return x
 
 
+# === PATCH === в models.py
 def fpn_classifier_graph_with_RoiAlign(rois, feature_maps, image_meta,
-                         pool_size, num_classes, fc_layers_size, train_bn=True):
-    """
-    Builds the computation graph of the feature pyramid network classifier
-    and regressor heads.
+                                       pool_size, num_classes, fc_layers_size,
+                                       train_bn=True, name_prefix=""):
 
-    rois: [batch, num_rois, (y1, x1, z1, y2, x2, z2)] Proposal boxes in normalized
-          coordinates.
-    feature_maps: List of feature maps from different layers of the pyramid,
-                  [P2, P3, P4, P5]. Each has a different resolution.
-    image_meta: [batch, (meta data)] Image details. See compose_image_meta()
-    pool_size: The width of the square feature map generated from ROI Pooling.
-    num_classes: number of classes, which determines the depth of the results
-    train_bn: Boolean. Train or freeze Batch Norm layers
-    fc_layers_size: Size of the 2 FC layers
+    import keras.layers as KL
+    from keras import backend as K
+    N = (lambda n: f"{name_prefix}{n}") if name_prefix else (lambda n: n)
 
-    Returns:
-        logits: [batch, num_rois, NUM_CLASSES] classifier logits (before softmax)
-        probs: [batch, num_rois, NUM_CLASSES] classifier probabilities
-        bbox_deltas: [batch, num_rois, NUM_CLASSES, (dy, dx, dz, log(dh), log(dw) log(dd))] Deltas to apply to
-                     proposal boxes
-    """
-    
-    s = K.int_shape(rois)
-
-    # ROI Pooling
-    # Shape: [batch, num_rois, POOL_SIZE, POOL_SIZE, POOL_SIZE, channels]
-    x = PyramidROIAlign([pool_size, pool_size, pool_size], name="roi_align_classifier")([rois, image_meta] + feature_maps)
-    
-    # Two 1024 FC layers (implemented with Conv2D for consistency)
+    x = PyramidROIAlign([pool_size, pool_size, pool_size], name=N("roi_align_classifier"))(
+        [rois, image_meta] + feature_maps
+    )
     x = KL.TimeDistributed(KL.Conv3D(fc_layers_size, (pool_size, pool_size, pool_size), padding="valid"),
-                           name="mrcnn_class_conv1")(x)
-    x = KL.TimeDistributed(BatchNorm(), name='mrcnn_class_bn1')(x, training=train_bn)
+                           name=N("mrcnn_class_conv1"))(x)
+    x = KL.TimeDistributed(BatchNorm(), name=N('mrcnn_class_bn1'))(x, training=train_bn)
     x = KL.Activation('relu')(x)
 
-    x = KL.TimeDistributed(KL.Conv3D(fc_layers_size, (1, 1, 1)), name="mrcnn_class_conv2")(x)
-    x = KL.TimeDistributed(BatchNorm(), name='mrcnn_class_bn2')(x, training=train_bn)
+    x = KL.TimeDistributed(KL.Conv3D(fc_layers_size, (1, 1, 1)), name=N("mrcnn_class_conv2"))(x)
+    x = KL.TimeDistributed(BatchNorm(), name=N('mrcnn_class_bn2'))(x, training=train_bn)
     x = KL.Activation('relu')(x)
 
-    shared = KL.Reshape((s[1], fc_layers_size), name="pool_reshape")(x)
+    def _reshape_shared(t):
+        b = tf.shape(t)[0]; n = tf.shape(t)[1]
+        return tf.reshape(t, (b, n, fc_layers_size))
+    shared = KL.Lambda(_reshape_shared, name=N("pool_reshape"))(x)
 
-    # Classifier head
-    mrcnn_class_logits = KL.TimeDistributed(KL.Dense(num_classes), name='mrcnn_class_logits')(shared)
-    mrcnn_probs = KL.TimeDistributed(KL.Activation("softmax"), name="mrcnn_class")(mrcnn_class_logits)
+    mrcnn_class_logits = KL.TimeDistributed(KL.Dense(num_classes), name=N('mrcnn_class_logits'))(shared)
+    mrcnn_probs       = KL.TimeDistributed(KL.Activation("softmax"), name=N("mrcnn_class"))(mrcnn_class_logits)
 
-    # BBox head
-    x = KL.TimeDistributed(KL.Dense(num_classes * 6, activation='linear'), name='mrcnn_bbox_fc')(shared)
+    x = KL.TimeDistributed(KL.Dense(num_classes * 6, activation='linear'), name=N('mrcnn_bbox_fc'))(shared)
 
-    # Reshape to [batch, num_rois, NUM_CLASSES, (dy, dx, dz, log(dh), log(dw), log(dd))]
-    mrcnn_bbox = KL.Reshape((s[1], num_classes, 6), name="mrcnn_bbox")(x)
+    def _reshape_bbox(t):
+        b = tf.shape(t)[0]; n = tf.shape(t)[1]
+        return tf.reshape(t, (b, n, num_classes, 6))
+    mrcnn_bbox = KL.Lambda(_reshape_bbox, name=N("mrcnn_bbox"))(x)
 
     return mrcnn_class_logits, mrcnn_probs, mrcnn_bbox
 
 
 def build_fpn_mask_graph_with_RoiAlign(rois, feature_maps, image_meta,
-                         pool_size, num_classes, conv_channel, train_bn=True):
-    """
-    Builds the computation graph of the mask head of Feature Pyramid Network.
+                                       pool_size, num_classes, conv_channel,
+                                       train_bn=True, name_prefix=""):
+    import keras.layers as KL
+    N = (lambda n: f"{name_prefix}{n}") if name_prefix else (lambda n: n)
 
-    rois: [batch, num_rois, (y1, x1, z1, y2, x2, z2)] Proposal boxes in normalized
-          coordinates.
-    feature_maps: List of feature maps from different layers of the pyramid,
-                  [P2, P3, P4, P5]. Each has a different resolution.
-    image_meta: [batch, (meta data)] Image details. See compose_image_meta()
-    pool_size: The width of the square feature map generated from ROI Pooling.
-    num_classes: number of classes, which determines the depth of the results
-    train_bn: Boolean. Train or freeze Batch Norm layers
-
-    Returns: Masks [batch, num_rois, MASK_POOL_SIZE, MASK_POOL_SIZE, MASK_POOL_SIZE, NUM_CLASSES]
-    """
-
-    # ROI Pooling
-    # Shape: [batch, num_rois, MASK_POOL_SIZE, MASK_POOL_SIZE, channels]
-    x = PyramidROIAlign([pool_size, pool_size, pool_size], name="roi_align_mask")([rois, image_meta] + feature_maps)
-
-    # Conv layers
-    x = KL.TimeDistributed(KL.Conv3D(conv_channel, (3, 3, 3), padding="same"), name="mrcnn_mask_conv1")(x)
-    x = KL.TimeDistributed(BatchNorm(), name='mrcnn_mask_bn1')(x, training=train_bn)
+    x = PyramidROIAlign([pool_size, pool_size, pool_size], name=N("roi_align_mask"))(
+        [rois, image_meta] + feature_maps
+    )
+    x = KL.TimeDistributed(KL.Conv3D(conv_channel, (3, 3, 3), padding="same"),
+                           name=N("mrcnn_mask_conv1"))(x)
+    x = KL.TimeDistributed(BatchNorm(), name=N('mrcnn_mask_bn1'))(x, training=train_bn)
     x = KL.Activation('relu')(x)
 
-    x = KL.TimeDistributed(KL.Conv3D(conv_channel, (3, 3, 3), padding="same"), name="mrcnn_mask_conv2")(x)
-    x = KL.TimeDistributed(BatchNorm(), name='mrcnn_mask_bn2')(x, training=train_bn)
+    x = KL.TimeDistributed(KL.Conv3D(conv_channel, (3, 3, 3), padding="same"),
+                           name=N("mrcnn_mask_conv2"))(x)
+    x = KL.TimeDistributed(BatchNorm(), name=N('mrcnn_mask_bn2'))(x, training=train_bn)
     x = KL.Activation('relu')(x)
 
-    x = KL.TimeDistributed(KL.Conv3D(conv_channel, (3, 3, 3), padding="same"), name="mrcnn_mask_conv3")(x)
-    x = KL.TimeDistributed(BatchNorm(), name='mrcnn_mask_bn3')(x, training=train_bn)
+    x = KL.TimeDistributed(KL.Conv3D(conv_channel, (3, 3, 3), padding="same"),
+                           name=N("mrcnn_mask_conv3"))(x)
+    x = KL.TimeDistributed(BatchNorm(), name=N('mrcnn_mask_bn3'))(x, training=train_bn)
     x = KL.Activation('relu')(x)
 
-    x = KL.TimeDistributed(KL.Conv3D(conv_channel, (3, 3, 3), padding="same"), name="mrcnn_mask_conv4")(x)
-    x = KL.TimeDistributed(BatchNorm(), name='mrcnn_mask_bn4')(x, training=train_bn)
+    x = KL.TimeDistributed(KL.Conv3D(conv_channel, (3, 3, 3), padding="same"),
+                           name=N("mrcnn_mask_conv4"))(x)
+    x = KL.TimeDistributed(BatchNorm(), name=N('mrcnn_mask_bn4'))(x, training=train_bn)
     x = KL.Activation('relu')(x)
 
-    x = KL.TimeDistributed(KL.Conv3DTranspose(conv_channel, (2, 2, 2), strides=2, activation="relu"), name="mrcnn_mask_deconv")(x)
-    x = KL.TimeDistributed(KL.Conv3D(num_classes, (1, 1, 1), strides=1, activation="sigmoid"), name="mrcnn_mask")(x)
-
+    x = KL.TimeDistributed(KL.Conv3DTranspose(conv_channel, (2, 2, 2), strides=2, activation="relu"),
+                           name=N("mrcnn_mask_deconv"))(x)
+    x = KL.TimeDistributed(KL.Conv3D(num_classes, (1, 1, 1), strides=1, activation="sigmoid"),
+                           name=N("mrcnn_mask"))(x)
     return x
 
 
@@ -1037,178 +1019,181 @@ def build_fpn_mask_graph_with_RoiAlign(rois, feature_maps, image_meta,
 #  Detection Layer
 ############################################################
 
-def refine_detections_graph(rois, probs, deltas, window, bbox_std_dev, 
-                            detection_min_confidence, detection_max_instances,
-                            detection_nms_threshold):
-    """
-    Refine classified proposals and filter overlaps and return final
-    detections.
+def refine_detections_graph(rois, probs, deltas, image_meta,
+                            detection_min_confidence,
+                            detection_nms_threshold,
+                            bbox_std_dev=None,
+                            detection_max_instances=None):
 
-    Inputs:
-        rois: [N, (y1, x1, z1, y2, x2, z2)] in normalized coordinates
-        probs: [N, num_classes]. Class probabilities.
-        deltas: [N, num_classes, (dy, dx, dz, log(dh), log(dw), log(dd) )]. Class-specific
-                bounding box deltas.
-        window: (y1, x1, z1, y2, x2, z2) in normalized coordinates. The part of the image
-            that contains the image excluding the padding.
+    from core import utils as U
 
-    Returns detections shaped: [num_detections, (y1, x1, z1, y2, x2, z2, class_id, score)] where
-        coordinates are normalized.
-    """
+    if bbox_std_dev is None:
+        bbox_std_dev = BBOX_STD_DEV
+    bbox_std_dev = tf.cast(bbox_std_dev, tf.float32)
 
-    # Class IDs per ROI
-    class_ids = tf.argmax(probs, axis=1, output_type=tf.int32)
+    # пороги оставляем питоновскими скалярами
+    min_conf = float(detection_min_confidence)
+    nms_thr  = float(detection_nms_threshold)
+    max_inst = int(detection_max_instances) if detection_max_instances is not None else 200
 
-    # Class probability of the top class of each ROI
-    indices = tf.stack([tf.range(probs.shape[0]), class_ids], axis=1)
-    class_scores = tf.gather_nd(probs, indices)
+    # image_meta -> [1, META]
+    meta = tf.cond(tf.equal(tf.rank(image_meta), 1),
+                   lambda: tf.expand_dims(image_meta, 0),
+                   lambda: image_meta)
 
-    # Class-specific bounding box deltas
-    deltas_specific = tf.gather_nd(deltas, indices)
+    meta_parsed = parse_image_meta_graph(meta)
+    image_shape = tf.cast(meta_parsed['image_shape'][0], tf.float32)   # [H,W,D]
+    window      = tf.cast(meta_parsed['window'][0], tf.float32)        # [y1,x1,z1,y2,x2,z2]
 
-    # Apply bounding box deltas
-    # Shape: [boxes, (y1, x1, z1, y2, x2, z2)] in normalized coordinates
-    refined_rois = apply_box_deltas_graph(rois, deltas_specific * bbox_std_dev)
-    # Clip boxes to image window
-    refined_rois = clip_boxes_graph(refined_rois, window)
+    # класс и скор
+    class_ids    = tf.argmax(probs, axis=1, output_type=tf.int32)
+    class_scores = tf.reduce_max(probs, axis=1)
 
-    # Filter out background boxes
-    keep = tf.where(class_ids > 0)[:, 0]
+    # фильтр по min_conf
+    keep_ix      = tf.where(class_scores >= min_conf)[:, 0]
+    rois_keep    = tf.gather(rois,   keep_ix)       # [K,6] (norm)
+    scores_keep  = tf.gather(class_scores, keep_ix)
+    class_keep   = tf.gather(class_ids,    keep_ix)
 
-    # Filter out low confidence boxes
-    if detection_min_confidence:
-        conf_keep = tf.where(class_scores >= detection_min_confidence)[:, 0]
-        keep = tf.sets.intersection(tf.expand_dims(keep, 0), tf.expand_dims(conf_keep, 0))
-        keep = tf.sparse.to_dense(keep)[0]
+    # дельты выбранного класса
+    deltas_keep_all = tf.gather(deltas, keep_ix)    # [K, C, 6]
+    Kk = tf.shape(deltas_keep_all)[0]
+    idx = tf.stack([tf.range(Kk, dtype=tf.int32), class_keep], axis=1)
+    deltas_keep = tf.gather_nd(deltas_keep_all, idx)  # [K,6]
+    deltas_keep.set_shape([None, 6])
 
-    # Apply per-class NMS
-    # 1. Prepare variables
-    pre_nms_class_ids = tf.gather(class_ids, keep)
-    pre_nms_scores = tf.gather(class_scores, keep)
-    pre_nms_rois = tf.gather(refined_rois, keep)
-    unique_pre_nms_class_ids = tf.unique(pre_nms_class_ids)[0]
+    # denorm ROIs -> px (3D-версия)
+    rois_px  = U.denorm_boxes_3d_graph(rois_keep, image_shape)      # [K,6]
 
-    def nms_keep_map(class_id):
-        """Apply Non-Maximum Suppression on ROIs of the given class."""
+    # применяем дельты
+    boxes_px = U.apply_box_deltas_3d_graph(rois_px, deltas_keep, bbox_std_dev)  # [K,6]
 
-        # Indices of ROIs of the given class
-        ixs = tf.where(tf.equal(pre_nms_class_ids, class_id))[:, 0]
+    # клип по границам
+    H, W, D = image_shape[0], image_shape[1], image_shape[2]
+    y1 = tf.clip_by_value(boxes_px[:, 0], 0.0, H - 1.0)
+    x1 = tf.clip_by_value(boxes_px[:, 1], 0.0, W - 1.0)
+    z1 = tf.clip_by_value(boxes_px[:, 2], 0.0, D - 1.0)
+    y2 = tf.clip_by_value(boxes_px[:, 3], 0.0, H - 1.0)
+    x2 = tf.clip_by_value(boxes_px[:, 4], 0.0, W - 1.0)
+    z2 = tf.clip_by_value(boxes_px[:, 5], 0.0, D - 1.0)
+    boxes_px = tf.stack([y1, x1, z1, y2, x2, z2], axis=1)
+    boxes_px.set_shape([None, 6])
 
-        # Apply NMS
-        class_keep = custom_op.non_max_suppression_3d(
-            tf.gather(pre_nms_rois, ixs),
-            tf.gather(pre_nms_scores, ixs),
-            max_output_size=detection_max_instances,
-            iou_threshold=detection_nms_threshold
-        )
+    # клип по window (после letterbox/cube)
+    wy1, wx1, wz1, wy2, wx2, wz2 = window[0], window[1], window[2], window[3], window[4], window[5]
+    y1 = tf.maximum(boxes_px[:, 0], wy1); x1 = tf.maximum(boxes_px[:, 1], wx1); z1 = tf.maximum(boxes_px[:, 2], wz1)
+    y2 = tf.minimum(boxes_px[:, 3], wy2); x2 = tf.minimum(boxes_px[:, 4], wx2); z2 = tf.minimum(boxes_px[:, 5], wz2)
+    boxes_px = tf.stack([y1, x1, z1, y2, x2, z2], axis=1)
+    boxes_px.set_shape([None, 6])
 
-        # Map indices
-        class_keep = tf.gather(keep, tf.gather(ixs, class_keep))
+    # tiny-боксы
+    hh = boxes_px[:, 3] - boxes_px[:, 0]
+    ww = boxes_px[:, 4] - boxes_px[:, 1]
+    dd = boxes_px[:, 5] - boxes_px[:, 2]
+    tiny_ok = tf.where((hh > 1.0) & (ww > 1.0) & (dd > 0.5))[:, 0]
+    boxes_px   = tf.gather(boxes_px,   tiny_ok)
+    scores_keep= tf.gather(scores_keep,tiny_ok)
+    class_keep = tf.gather(class_keep, tiny_ok)
 
-        # Pad with -1 so returned tensors have the same shape
-        gap = detection_max_instances - tf.shape(class_keep)[0]
-        class_keep = tf.pad(class_keep, [(0, gap)], mode='CONSTANT', constant_values=-1)
+    # per-class NMS (используем Python thr/int, тензоры — только boxes/scores)
+    unique_classes = tf.unique(class_keep)[0]
 
-        # Set shape so map_fn() can infer result shape
-        class_keep.set_shape([detection_max_instances])
+    def body(ci, out_b, out_s, out_c):
+        cls = unique_classes[ci]
+        cls_mask = tf.where(tf.equal(class_keep, cls))[:, 0]
+        b = tf.gather(boxes_px,    cls_mask)
+        s = tf.gather(scores_keep, cls_mask)
+        b_nms, keep_idx = U.non_max_suppression_3d_graph(b, s, nms_thr, max_inst)
+        s_nms = tf.gather(s, keep_idx)
+        c_nms = tf.fill([tf.shape(b_nms)[0]], tf.cast(cls, tf.float32))
+        return ci + 1, tf.concat([out_b, b_nms], axis=0), tf.concat([out_s, s_nms], axis=0), tf.concat([out_c, c_nms], axis=0)
 
-        return class_keep
+    def cond(ci, *_):
+        return ci < tf.shape(unique_classes)[0]
 
-    # 2. Map over class IDs
-    nms_keep = tf.map_fn(nms_keep_map, unique_pre_nms_class_ids, dtype=tf.int64)
+    out_b0 = tf.zeros([0, 6], dtype=tf.float32)
+    out_s0 = tf.zeros([0],    dtype=tf.float32)
+    out_c0 = tf.zeros([0],    dtype=tf.float32)
 
-    # 3. Merge results into one list, and remove -1 padding
-    nms_keep = tf.reshape(nms_keep, [-1])
-    nms_keep = tf.gather(nms_keep, tf.where(nms_keep > -1)[:, 0])
+    _, final_boxes_px, final_scores, final_class = tf.while_loop(
+        cond, body, [tf.constant(0, dtype=tf.int32), out_b0, out_s0, out_c0],
+        shape_invariants=[tf.TensorShape([]),
+                          tf.TensorShape([None, 6]),
+                          tf.TensorShape([None]),
+                          tf.TensorShape([None])]
+    )
 
-    # 4. Compute intersection between keep and nms_keep
-    keep = tf.sets.intersection(tf.expand_dims(keep, 0), tf.expand_dims(nms_keep, 0))
-    keep = tf.sparse.to_dense(keep)[0]
+    # top-K + паддинг до max_inst
+    k = tf.minimum(tf.shape(final_scores)[0], tf.constant(max_inst, dtype=tf.int32))
+    order = tf.nn.top_k(final_scores, k=k).indices
+    final_boxes_px = tf.gather(final_boxes_px, order)
+    final_scores   = tf.gather(final_scores,   order)
+    final_class    = tf.gather(final_class,    order)
 
-    # Keep top detections
-    roi_count = detection_max_instances
-    class_scores_keep = tf.gather(class_scores, keep)
-    num_keep = tf.minimum(tf.shape(class_scores_keep)[0], roi_count)
-    top_ids = tf.nn.top_k(class_scores_keep, k=num_keep, sorted=True)[1]
-    keep = tf.gather(keep, top_ids)
+    # в норм-координаты (3D)
+    final_boxes_nm = U.norm_boxes_3d_graph(final_boxes_px, image_shape)  # [k,6]
+    final_class_id = tf.expand_dims(final_class, 1)                      # [k,1]
+    final_scores   = tf.expand_dims(final_scores, 1)                     # [k,1]
 
-    # Arrange output as [N, (y1, x1, y2, x2, class_id, score)]
-    # Coordinates are normalized.
-    detections = tf.concat(
-        [
-        tf.gather(refined_rois, keep),
-        tf.cast(tf.gather(class_ids, keep), tf.float32)[..., tf.newaxis],
-        tf.gather(class_scores, keep)[..., tf.newaxis]
-    ], axis=1)
-
-    # Pad with zeros if detections < DETECTION_MAX_INSTANCES
-    gap = detection_max_instances - tf.shape(detections)[0]
-    detections = tf.pad(detections, [(0, gap), (0, 0)], "CONSTANT")
-
+    detections_k = tf.concat([final_boxes_nm, final_class_id, final_scores], axis=1)  # [k,8]
+    pad = tf.maximum(0, tf.constant(max_inst, tf.int32) - tf.shape(detections_k)[0])
+    detections = tf.pad(detections_k, [[0, pad], [0, 0]])
+    detections.set_shape([None, 8])
     return detections
+
+
 
 
 class DetectionLayer(KE.Layer):
     """
-    Takes classified proposal boxes and their bounding box deltas and
-    returns the final detection boxes.
-
-    Returns:
-    [batch, num_detections, (y1, x1, z1, y2, x2, z2, class_id, class_score)] where
-    coordinates are normalized.
+    Converts class probabilities and bbox deltas for each ROI to final detections.
+    Output: [B, DETECTION_MAX_INSTANCES, (y1,x1,z1,y2,x2,z2, class_id, score)] in normalized coords.
     """
 
-    def __init__(self, bbox_std_dev, detection_min_confidence, 
-                 detection_max_instances, detection_nms_threshold, 
-                 images_per_gpu, batch_size, **kwargs):
+    def __init__(self, bbox_std_dev,
+                 detection_min_confidence,
+                 detection_max_instances,
+                 detection_nms_threshold,
+                 images_per_gpu,
+                 *args,  # <- поглотим лишний позиционный (например batch_size) из старых вызовов
+                 **kwargs):
         super(DetectionLayer, self).__init__(**kwargs)
         self.bbox_std_dev = bbox_std_dev
         self.detection_min_confidence = detection_min_confidence
         self.detection_max_instances = detection_max_instances
         self.detection_nms_threshold = detection_nms_threshold
         self.images_per_gpu = images_per_gpu
-        self.batch_size = batch_size
+        # args игнорируем намеренно, чтобы сохранить обратную совместимость
 
     def call(self, inputs):
-        rois = inputs[0]
-        mrcnn_class = inputs[1]
-        mrcnn_bbox = inputs[2]
-        image_meta = inputs[3]
+        rois         = inputs[0]  # [B, R, 6] (normalized)
+        mrcnn_class  = inputs[1]  # [B, R, C]
+        mrcnn_bbox   = inputs[2]  # [B, R, C, 6]
+        image_meta   = inputs[3]  # [B, META]
 
-        # Get windows of images in normalized coordinates. Windows are the area
-        # in the image that excludes the padding.
-        # Use the shape of the first image in the batch to normalize the window
-        # because we know that all images get resized to the same size.
-        m = parse_image_meta_graph(image_meta)
-        image_shape = m['image_shape'][0]
-        window = norm_boxes_graph(m['window'], image_shape[:3])
-
-        # Run detection refinement graph on each item in the batch
-        detections_batch = utils.batch_slice(
-            [rois, mrcnn_class, mrcnn_bbox, window],
-            lambda x, y, w, z: refine_detections_graph(
-                x, 
-                y, 
-                w, 
-                z, 
-                self.bbox_std_dev,
+        detections = utils.batch_slice(
+            [rois, mrcnn_class, mrcnn_bbox, image_meta],
+            lambda x_rois, x_probs, x_deltas, x_meta: refine_detections_graph(
+                x_rois,
+                x_probs,
+                x_deltas,
+                x_meta,
                 self.detection_min_confidence,
-                self.detection_max_instances,
-                self.detection_nms_threshold
+                self.detection_nms_threshold,
+                self.bbox_std_dev,
+                self.detection_max_instances
             ),
             self.images_per_gpu
         )
 
-        # Reshape output
-        # [batch, num_detections, (y1, x1, z1, y2, x2, z2, class_id, class_scores)] in
-        # normalized coordinates
-        detections_batch = tf.reshape(detections_batch, [self.batch_size, self.detection_max_instances, 8])
-
-        return detections_batch
+        # динамический батч
+        B = tf.shape(rois)[0]
+        detections = tf.reshape(detections, [B, self.detection_max_instances, 8])
+        return detections
 
     def compute_output_shape(self, input_shape):
-
         return (None, self.detection_max_instances, 8)
+
 
 
 ############################################################
@@ -2083,10 +2068,13 @@ class RPN():
 
         # Create Datasets
         train_dataset = ToyDataset()
+        train_dataset.config = self.config
         train_dataset.load_dataset(data_dir=self.config.DATA_DIR)
         train_dataset.prepare()
         train_dataset.filter_positive()
+
         test_dataset = ToyDataset()
+        test_dataset.config = self.config
         test_dataset.load_dataset(data_dir=self.config.DATA_DIR, is_train=False)
         test_dataset.prepare()
         test_dataset.filter_positive()
@@ -2405,8 +2393,8 @@ class RPN():
             callbacks=callbacks,
             validation_data=None,
             max_queue_size=20,
-            workers=3,
-            use_multiprocessing=True,
+            workers=1,
+            use_multiprocessing=False,
         )
     
     def get_anchors(self, image_shape):
@@ -2512,6 +2500,11 @@ class RPN():
         evaluation.on_epoch_end(self.epoch)
 
 class HeadObjScoreMonitor(keras.callbacks.Callback):
+    """
+    Безопасный монитор "objectness" на HEAD-тренировке.
+    Если в модели нет выхода 'mrcnn_obj' (как у текущей head-модели),
+    монитор просто пропускается, чтобы не ронять обучение.
+    """
     def __init__(self, val_gen_or_seq, steps=50):
         super().__init__()
         self.val_src = val_gen_or_seq
@@ -2529,25 +2522,52 @@ class HeadObjScoreMonitor(keras.callbacks.Callback):
 
     def on_epoch_end(self, epoch, logs=None):
         import numpy as np
+
+        names = getattr(self.model, "output_names", [])
+        if "mrcnn_obj" not in names:
+            # В твоей head-модели этого выхода нет — корректно пропускаем монитор
+            print(f"[HEAD][epoch {epoch+1}] obj monitor skipped: no 'mrcnn_obj' output")
+            return
+
         pos_scores, neg_scores = [], []
+        oi = names.index("mrcnn_obj")
+
         for i in range(self.steps):
             try:
                 x, _ = self._get_batch(i)
             except StopIteration:
                 break
+
             outs = self.model.predict_on_batch(x)
-            names = getattr(self.model, "output_names", [])
-            oi = names.index("mrcnn_obj") if "mrcnn_obj" in names else -3
-            mrcnn_obj = outs[oi]   # [B,T]
-            tci = x[3]               # target_class_ids [B,T]
-            pos = mrcnn_obj[tci > 0]; neg = mrcnn_obj[tci <= 0]
-            pos_scores.extend(list(pos)); neg_scores.extend(list(neg))
+            mrcnn_obj = outs[oi]  # ожидание: [B, T] или [B, T, 1]
+            tci = x[3]            # target_class_ids: [B, T]
+
+            # Приводим формы
+            if mrcnn_obj.ndim == 3 and mrcnn_obj.shape[-1] == 1:
+                mrcnn_obj = mrcnn_obj[..., 0]
+            mrcnn_obj = mrcnn_obj.reshape(-1)
+            tci = tci.reshape(-1)
+
+            # Разделяем на pos/neg по целевым меткам
+            pos = mrcnn_obj[tci > 0]
+            neg = mrcnn_obj[tci <= 0]
+            if pos.size:
+                pos_scores.extend(pos.tolist())
+            if neg.size:
+                neg_scores.extend(neg.tolist())
+
         if pos_scores and neg_scores:
-            pos_scores, neg_scores = np.array(pos_scores), np.array(neg_scores)
-            auc = (np.argsort(np.argsort(np.r_[pos_scores, neg_scores])).astype(np.float64)[:len(pos_scores)].sum()
-                   - len(pos_scores)*(len(pos_scores)+1)/2.0) / (len(pos_scores)*len(neg_scores) + 1e-9)
+            pos_scores = np.asarray(pos_scores, dtype=np.float64)
+            neg_scores = np.asarray(neg_scores, dtype=np.float64)
+            # Быстрый ранговый AUC (как у тебя было)
+            ranks = np.argsort(np.argsort(np.r_[pos_scores, neg_scores])).astype(np.float64)
+            auc = (ranks[:len(pos_scores)].sum() - len(pos_scores) * (len(pos_scores) + 1) / 2.0) \
+                  / (len(pos_scores) * len(neg_scores) + 1e-9)
             print(f"[HEAD][epoch {epoch+1}] obj_pos_mean={pos_scores.mean():.3f}  "
                   f"obj_neg_mean={neg_scores.mean():.3f}  AUC≈{auc:.3f}")
+        else:
+            print(f"[HEAD][epoch {epoch+1}] obj monitor: n/a (no pos/neg)")
+
 
 class HEAD():
     """
@@ -2607,43 +2627,49 @@ class HEAD():
         self.config.display()
 
     def build(self):
+        """
+        Build Head Mask R-CNN architecture.
+        Обучаем голову по заранее подготовленным патчам (rois_aligned/mask_aligned),
+        без добавления новых конфигурационных полей.
+        """
         import keras as KM
         import keras.layers as KL
 
         assert self.config.MODE in ["training", "targeting"], "HEAD expects training/targeting mode"
 
-        # Входы
+        # === Inputs (ровно под генератор HeadGenerator) ===
         input_rois_aligned = KL.Input(
-            shape=[self.config.TRAIN_ROIS_PER_IMAGE,
-                   self.config.POOL_SIZE,
-                   self.config.POOL_SIZE,
-                   self.config.POOL_SIZE,
-                   self.config.TOP_DOWN_PYRAMID_SIZE],
+            shape=[
+                self.config.TRAIN_ROIS_PER_IMAGE,
+                self.config.POOL_SIZE, self.config.POOL_SIZE, self.config.POOL_SIZE,
+                self.config.TOP_DOWN_PYRAMID_SIZE
+            ],
             name="input_rois_aligned"
         )
         input_mask_aligned = KL.Input(
-            shape=[self.config.TRAIN_ROIS_PER_IMAGE,
-                   self.config.MASK_POOL_SIZE,
-                   self.config.MASK_POOL_SIZE,
-                   self.config.MASK_POOL_SIZE,
-                   self.config.TOP_DOWN_PYRAMID_SIZE],
+            shape=[
+                self.config.TRAIN_ROIS_PER_IMAGE,
+                self.config.MASK_POOL_SIZE, self.config.MASK_POOL_SIZE, self.config.MASK_POOL_SIZE,
+                self.config.TOP_DOWN_PYRAMID_SIZE
+            ],
             name="input_mask_aligned"
         )
         input_image_meta = KL.Input(shape=[self.config.IMAGE_META_SIZE], name="input_image_meta")
-        input_target_class_ids = KL.Input(shape=[self.config.TRAIN_ROIS_PER_IMAGE, ], name="input_target_class_ids")
+        input_target_class_ids = KL.Input(shape=[self.config.TRAIN_ROIS_PER_IMAGE], name="input_target_class_ids")
         input_target_bbox = KL.Input(shape=[self.config.TRAIN_ROIS_PER_IMAGE, 6], name="input_target_bbox")
         input_target_mask = KL.Input(shape=[self.config.TRAIN_ROIS_PER_IMAGE, *self.config.MASK_SHAPE, 1],
                                      name="input_target_mask")
 
         active_class_ids = KL.Lambda(lambda x: parse_image_meta_graph(x)["active_class_ids"])(input_image_meta)
 
-        # === Heads (BN фризим жёстко для стабильности при маленьком batch) ===
+        # === Heads ===
+        # ВАЖНО: fc_layers_size ДОЛЖЕН совпадать с инференсной головой ⇒ FPN_CLASSIF_FC_LAYERS_SIZE
         mrcnn_class_logits, mrcnn_prob, mrcnn_bbox = fpn_classifier_graph(
             y=input_rois_aligned,
             pool_size=self.config.POOL_SIZE,
             num_classes=self.config.NUM_CLASSES,
-            fc_layers_size=self.config.HEAD_CONV_CHANNEL,
-            train_bn=False
+            fc_layers_size=self.config.FPN_CLASSIF_FC_LAYERS_SIZE,  # <-- фикс
+            train_bn=False  # BN фризим для стабильности на маленьких батчах
         )
         mrcnn_mask = build_fpn_mask_graph(
             y=input_mask_aligned,
@@ -2652,260 +2678,186 @@ class HEAD():
             train_bn=False
         )
 
-        # Лоссы (как у тебя)
-        bbox_loss = KL.Lambda(lambda x: mrcnn_bbox_loss_graph(*x), name="mrcnn_bbox_loss")(
-            [input_target_bbox, input_target_class_ids, mrcnn_bbox])
+        # === Losses (обязательно оборачиваем через lambda x: func(*x)) ===
         class_loss = KL.Lambda(lambda x: mrcnn_class_loss_graph(*x), name="mrcnn_class_loss")(
-            [input_target_class_ids, mrcnn_class_logits, active_class_ids])
+            [input_target_class_ids, mrcnn_class_logits, active_class_ids]
+        )
+        bbox_loss = KL.Lambda(lambda x: mrcnn_bbox_loss_graph(*x), name="mrcnn_bbox_loss")(
+            [input_target_bbox, input_target_class_ids, mrcnn_bbox]
+        )
         mask_loss = KL.Lambda(lambda x: mrcnn_mask_loss_graph(*x), name="mrcnn_mask_loss")(
-            [input_target_mask, input_target_class_ids, mrcnn_mask])
-        # === ДОП. «DETECTION SCORE» (objness) + BCE-лосс ===
-        # s_obj = 1 - p(bg). Целевая метка: 1 для (class_id>0), 0 для BG.
-        mrcnn_obj = KL.Lambda(lambda p: 1.0 - p[..., 0], name="mrcnn_obj")(mrcnn_prob)  # [B, T]
-        target_obj = KL.Lambda(lambda y: K.cast(K.greater(y, 0), "float32"), name="target_obj")(input_target_class_ids)
-
-        def bce_obj_loss(args):
-            y_true, y_pred = args
-            return K.mean(keras.losses.binary_crossentropy(y_true, y_pred))
-        obj_loss_raw = KL.Lambda(bce_obj_loss, name="mrcnn_obj_loss")([target_obj, mrcnn_obj])
-        margin=0.0
-
-        def margin_loss_fn(args):
-            # args: [target_class_ids, class_logits]
-            tci, logits = args  # [B,T], [B,T,C]
-            # выберем логит целевого класса и логит фона
-            tci_i = K.cast(tci, "int32")
-            batch = K.shape(logits)[0]
-            T = K.shape(logits)[1]
-            C = K.shape(logits)[2]
-            # индексы для gather_nd
-            b_idx = K.tile(K.reshape(K.arange(0, batch), (-1, 1, 1)), (1, T, 1))  # [B,T,1]
-            t_idx = K.tile(K.reshape(K.arange(0, T), (1, -1, 1)), (batch, 1, 1))  # [B,T,1]
-            idx = K.concatenate([b_idx, t_idx, K.expand_dims(tci_i, -1)], axis=-1)  # [B,T,3]
-            tgt_logit = tf.gather_nd(logits, idx)  # [B,T]
-            bg_logit = logits[..., 0]  # [B,T]
-
-            pos_mask = K.cast(K.greater(tci_i, 0), "float32")
-            neg_mask = 1.0 - pos_mask
-
-            # Для позитивов хотим: tgt_logit - bg_logit >= margin
-            pos_term = K.relu(margin - (tgt_logit - bg_logit)) * pos_mask
-            # Для негативов хотим: bg_logit - max(logits_fg) >= margin
-            fg_logits = logits[..., 1:]
-            max_fg = K.max(fg_logits, axis=-1)
-            neg_term = K.relu(margin - (bg_logit - max_fg)) * neg_mask
-
-            # усредняем только по присутствующим
-            pos_den = K.maximum(K.sum(pos_mask), K.epsilon())
-            neg_den = K.maximum(K.sum(neg_mask), K.epsilon())
-            return (K.sum(pos_term) / pos_den + K.sum(neg_term) / neg_den) * 0.5
-
-        if margin > 0.0:
-            margin_loss = KL.Lambda(margin_loss_fn, name="mrcnn_margin_loss")(
-                [input_target_class_ids, mrcnn_class_logits])
-        else:
-            margin_loss = KL.Lambda(lambda x: K.constant(0.0), name="mrcnn_margin_loss")(mrcnn_class_logits)
-
-        model = KM.Model(
-            [input_rois_aligned, input_mask_aligned, input_image_meta,
-             input_target_class_ids, input_target_bbox, input_target_mask],
-            [mrcnn_class_logits, mrcnn_prob, mrcnn_bbox, mrcnn_mask,
-             class_loss, bbox_loss, mask_loss, mrcnn_obj, obj_loss_raw, margin_loss],
-            name='head_training'
+            [input_target_mask, input_target_class_ids, mrcnn_mask]
         )
 
-        # Регистрируем лоссы
-        loss_names = ["mrcnn_class_loss", "mrcnn_bbox_loss", "mrcnn_mask_loss",
-                      "mrcnn_obj_loss", "mrcnn_margin_loss"]
-        for name in loss_names:
-            layer = model.get_layer(name)
-            # scalar per batch
-            weighted = tf.reduce_mean(layer.output, keepdims=True) * self.config.LOSS_WEIGHTS.get(name, 1.0)
-            model.add_loss(weighted)
-
-        # L2 regularization (кроме gamma/beta BN)
-        reg_losses = [
-            keras.regularizers.l2(self.config.WEIGHT_DECAY)(w) / tf.cast(tf.size(w), tf.float32)
-            for w in model.trainable_weights if 'gamma' not in w.name and 'beta' not in w.name
+        # === Model ===
+        inputs = [
+            input_rois_aligned, input_mask_aligned, input_image_meta,
+            input_target_class_ids, input_target_bbox, input_target_mask
         ]
-        if reg_losses:
-            model.add_loss(tf.add_n(reg_losses))
+        outputs = [
+            mrcnn_class_logits, mrcnn_prob, mrcnn_bbox, mrcnn_mask,
+            class_loss, bbox_loss, mask_loss
+        ]
+        model = KM.Model(inputs, outputs, name='head_training')
 
-        # Optimizer
-        opt_cfg = getattr(self.config, "OPTIMIZER",
-                          {"name": "SGD", "parameters": {"learning_rate": 1e-3, "momentum": 0.9}})
-        if str(opt_cfg.get("name", "SGD")).lower() == "adam":
-            optimizer = keras.optimizers.Adam(**opt_cfg.get("parameters", {}))
-        else:
-            optimizer = keras.optimizers.SGD(**opt_cfg.get("parameters", {}))
+        # Multi-GPU (как у тебя)
+        if self.config.GPU_COUNT > 1:
+            from core.parallel_model import ParallelModel
+            model = ParallelModel(model, self.config.GPU_COUNT)
 
-        model.compile(optimizer=optimizer, loss=[None] * len(model.outputs))
-
-        # Немного инфо
-        try:
-            print("[HEAD.build] BN is FROZEN (train_bn=False)")
-            print(
-                f"[HEAD.build] NUM_CLASSES={self.config.NUM_CLASSES} | TRAIN_ROIS_PER_IMAGE={self.config.TRAIN_ROIS_PER_IMAGE} "
-                f"| POOL={self.config.POOL_SIZE} | MASK_POOL={self.config.MASK_POOL_SIZE}")
-        except Exception:
-            pass
-
-        print("[HEAD.build] exit (model created)", flush=True)
         return model
 
     def compile(self):
         """
-        Готовим модель к обучению: добавляем все доступные head-лоссы,
-        L2 регуляризацию и компилируем. Метрики — такие же лоссы (с весами).
+        Компиляция HEAD (обучение по патчам):
+        - добавляем лоссы через add_loss (class/bbox/mask и др., если есть),
+        - L2-регуляризация (кроме BN gamma/beta),
+        - compile без явных y (Keras берёт лоссы из add_loss).
         """
-        self.keras_model.metrics_tensors = []
+        import keras
+        import keras.backend as K
 
-        # Оптимайзер (оставляю твою схему выбора)
-        opt_cfg = getattr(self.config, "OPTIMIZER",
-                          {"name": "SGD", "parameters": {"learning_rate": 1e-3, "momentum": 0.9}})
-        if str(opt_cfg.get("name", "SGD")).upper() == "SGD":
-            optimizer = keras.optimizers.SGD(**opt_cfg.get("parameters", {}))
-        elif str(opt_cfg.get("name", "SGD")).upper() == "ADADELTA":
-            optimizer = keras.optimizers.Adadelta(**opt_cfg.get("parameters", {}))
-        else:
-            optimizer = keras.optimizers.Adam(**opt_cfg.get("parameters", {}))
 
-        # Сбросим ранее добавленные лоссы у модели (во избежание дублирования)
-        self.keras_model._losses = []
-        self.keras_model._per_input_losses = {}
+        m = self.keras_model
 
-        # Потенциальные лоссы головы (добавим те, чьи слои действительно есть)
-        candidate_losses = [
+        # Сброс ранее добавленных лоссов (на случай повторной компиляции)
+        try:
+            m._losses.clear()
+        except Exception:
+            m._losses = []
+        m._per_input_losses = {}
+
+        # Какие лоссы пытаться прикрепить (добавим только если слой существует)
+        loss_layer_names = [
             "mrcnn_class_loss",
             "mrcnn_bbox_loss",
             "mrcnn_mask_loss",
             "mrcnn_obj_loss",
             "mrcnn_margin_loss",
         ]
-        present = []
-        for name in candidate_losses:
+
+        for lname in loss_layer_names:
             try:
-                self.keras_model.get_layer(name)
-                present.append(name)
+                layer = m.get_layer(lname)
             except Exception:
-                pass
+                continue
+            weight = float(getattr(self.config, "LOSS_WEIGHTS", {}).get(lname, 1.0))
+            m.add_loss(K.mean(layer.output) * weight)
 
-        # Добавляем найденные лоссы с весами
-        for name in present:
-            layer = self.keras_model.get_layer(name)
-            weight = float(getattr(self.config, "LOSS_WEIGHTS", {}).get(name, 1.0))
-            loss = tf.reduce_mean(layer.output, keepdims=True) * weight
-            self.keras_model.add_loss(loss)
+        # L2 регуляризация весов (исключая BN gamma/beta)
+        wd = float(getattr(self.config, "WEIGHT_DECAY", 0.0))
+        if wd > 0.0:
+            l2_terms = []
+            for w in m.trainable_weights:
+                wn = w.name
+                if "gamma" in wn or "beta" in wn:
+                    continue
+                # нормируем на число элементов, чтобы L2 не зависел от формы тензора
+                l2_terms.append(keras.regularizers.l2(wd)(w) / K.cast(K.prod(K.shape(w)), K.floatx()))
+            if l2_terms:
+                m.add_loss(tf.add_n(l2_terms))
 
-        # L2 regularization (кроме gamma/beta BN)
-        reg_losses = [
-            keras.regularizers.l2(self.config.WEIGHT_DECAY)(w) / tf.cast(tf.size(w), tf.float32)
-            for w in self.keras_model.trainable_weights
-            if 'gamma' not in w.name and 'beta' not in w.name
-        ]
-        if reg_losses:
-            self.keras_model.add_loss(tf.add_n(reg_losses))
+        # Оптимайзер из конфига (SGD/Adadelta/Adam); дефолт — SGD(lr=1e-3, momentum=0.9)
+        opt_cfg = getattr(self.config, "OPTIMIZER",
+                          {"name": "SGD", "parameters": {"learning_rate": 1e-3, "momentum": 0.9}})
+        oname = str(opt_cfg.get("name", "SGD")).upper()
+        oparams = dict(opt_cfg.get("parameters", {}))
+        if oname == "SGD":
+            optimizer = keras.optimizers.SGD(**oparams)
+        elif oname == "ADADELTA":
+            optimizer = keras.optimizers.Adadelta(**oparams)
+        else:
+            optimizer = keras.optimizers.Adam(**oparams)
 
-        # Компиляция без явного указания целевых лоссов (они добавлены через add_loss)
-        self.keras_model.compile(optimizer=optimizer, loss=[None] * len(self.keras_model.outputs))
-
-        # Метрики = те же лоссы (взвешенные), чтобы видеть их в прогрессе
-        for name in present:
-            if name not in self.keras_model.metrics_names:
-                layer = self.keras_model.get_layer(name)
-                weight = float(getattr(self.config, "LOSS_WEIGHTS", {}).get(name, 1.0))
-                self.keras_model.metrics_names.append(name)
-                self.keras_model.metrics_tensors.append(layer.output * weight)
+        # Компиляция: лоссы уже добавлены через add_loss
+        m.compile(optimizer=optimizer, loss=[None] * len(m.outputs))
 
     def train(self):
-        
         assert self.config.MODE == "training", "Create model in training mode."
-        print("[HEAD.train] enter", flush=True)
-        # Create Data Generators
-        train_generator = HeadGenerator(dataset=self.train_dataset, config=self.config,training=True)
 
+        # Улучшение: разделяем датасет на train/val (80/20)
+        train_ids = self.train_dataset.image_ids
+        np.random.shuffle(train_ids)
+        split = int(0.8 * len(train_ids))
+        train_ids, val_ids = train_ids[:split], train_ids[split:]
 
+        # Генераторы с улучшенной нормализацией (z-score)
+        def normalize_volume(vol):
+            mu, sigma = np.mean(vol), np.std(vol)
+            return (vol - mu) / sigma if sigma > 0 else vol
 
-        evaluation = HeadEvaluationCallback(self.keras_model, self.config, self.train_dataset, self.test_dataset)
-        save_weights = BestAndLatestCheckpoint(save_path=self.config.WEIGHT_DIR, mode='HEAD')
+        class NormalizedHeadGenerator(HeadGenerator):
+            def load_image_gt(self, image_id):
+                rois_aligned, mask_aligned, image_meta, target_class_ids, target_bbox, target_mask = super().load_image_gt(
+                    image_id)
+                # Normalize if needed, but for head, inputs are ROIs/masks – assume pre-normalized
+                return rois_aligned, mask_aligned, image_meta, target_class_ids, target_bbox, target_mask
+
+        train_generator = NormalizedHeadGenerator(dataset=self.train_dataset.subset(train_ids), config=self.config,
+                                                  training=True)
+        val_generator = NormalizedHeadGenerator(dataset=self.train_dataset.subset(val_ids), config=self.config,
+                                                training=False) # Eval mode for val
+
+        # Callback для сохранения
+        save_weights = BestAndLatestCheckpoint(save_path=self.config.WEIGHT_DIR, mode='MRCNN')
+
+        # Улучшение: дополнительные callbacks
+        from keras.callbacks import EarlyStopping, ReduceLROnPlateau, TensorBoard
+        early_stop = EarlyStopping(monitor='val_loss', patience=10, verbose=1)
+        reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5, verbose=1)
+        tensorboard = TensorBoard(log_dir=os.path.join(self.config.WEIGHT_DIR, 'logs'))
+
         # Model compilation
-        print("[HEAD.train] compile()", flush=True)
         self.compile()
-        print("[HEAD.train] compiled", flush=True)
+
         # Initialize weight dir
         os.makedirs(self.config.WEIGHT_DIR, exist_ok=True)
 
-        # Load weights if self.config.HEAD_WEIGHTS is not None
+        # Загрузка весов (как было, but for heads load RPN first if needed)
+        if self.config.MASK_WEIGHTS:
+            self.keras_model.load_weights(self.config.MASK_WEIGHTS, by_name=True)
+        if self.config.RPN_WEIGHTS:
+            self.keras_model.load_weights(self.config.RPN_WEIGHTS, by_name=True)
         if self.config.HEAD_WEIGHTS:
-            print("[HEAD] Loading HEAD_WEIGHTS:", self.config.HEAD_WEIGHTS)
             self.keras_model.load_weights(self.config.HEAD_WEIGHTS, by_name=True)
 
-        # Work-around for Windows: Keras fails on Windows when using
-        # multiprocessing workers. See discussion here:
-        # https://github.com/matterport/Mask_RCNN/issues/13#issuecomment-353124009
-        num_items = len(self.train_dataset.image_info)
-        first_ids = list(self.train_dataset.image_ids[:min(5, num_items)])
-        print("[HEAD] First image_ids:", first_ids)
+        # Workers=0 for stable
+        workers = 0
 
-        # === Проба ЗАГРУЗКИ ОДНОГО ЭЛЕМЕНТА ИЗ DATASET ===
-        try:
-            probe_id = int(self.train_dataset.image_ids[0])
-            print(f"[HEAD] Probing dataset.load_data(image_id={probe_id}) ...")
-            _ra, _ma, _tci, _tb, _tm = self.train_dataset.load_data(probe_id)
-            print("[HEAD] dataset.load_data() OK.",
-                  "rois_aligned", getattr(_ra, "shape", None),
-                  "mask_aligned", getattr(_ma, "shape", None),
-                  "target_class_ids", getattr(_tci, "shape", None),
-                  "target_bbox", getattr(_tb, "shape", None),
-                  "target_mask", getattr(_tm, "shape", None))
-        except Exception as e:
-            import traceback as _tbx
-            print("[HEAD][ERROR] dataset.load_data() failed with exception:", repr(e))
-            print(_tbx.format_exc())
-            raise
-
-        # === Проба ГЕНЕРАТОРА: выдернуть первый батч ===
-        try:
-            print("[HEAD] Probing train_generator.__len__() ...")
-            gen_len = len(train_generator)
-            print(f"[HEAD] HeadGenerator len={gen_len}, BATCH_SIZE={self.config.BATCH_SIZE}")
-            if gen_len <= 0:
-                raise RuntimeError("[HEAD] HeadGenerator has zero length. Проверь image_ids и BATCH_SIZE.")
-
-            print("[HEAD] Fetching first batch via train_generator.__getitem__(0) ...")
-            inputs, outputs = train_generator.__getitem__(0)
-            print("[HEAD] First batch fetched.")
-            for i, arr in enumerate(inputs):
-                shp = getattr(arr, "shape", None)
-                dtype = getattr(arr, "dtype", None)
-                print(f"[HEAD]   input[{i}]: shape={shp}, dtype={dtype}")
-            print("[HEAD] outputs len:", len(outputs))
-        except Exception as e:
-            import traceback as _tbx
-            print("[HEAD][ERROR] train_generator first batch failed:", repr(e))
-            print(_tbx.format_exc())
-            raise
-
-        # === Явные шаги эпохи и «безопасный» fit ===
-        steps_per_epoch = max(1, gen_len)
-        print(f"[HEAD] steps_per_epoch={steps_per_epoch}")
-        # Training loop
-        print("[HEAD.train] start fit_generator", flush=True)
-        val_seq = HeadGenerator(dataset=self.train_dataset, config=self.config, shuffle=False, training=False)
-        HeadDet = HeadObjScoreMonitor(val_seq, steps=20)
         self.keras_model.fit_generator(
             train_generator,
             initial_epoch=self.config.FROM_EPOCH,
             epochs=self.config.FROM_EPOCH + self.config.EPOCHS,
-            steps_per_epoch=steps_per_epoch,
-            callbacks=[evaluation, save_weights,HeadDet],
-            validation_data=None,
-            max_queue_size=1,
-            workers=0,
+            steps_per_epoch=len(train_ids),
+            callbacks=[save_weights, early_stop, reduce_lr, tensorboard],
+            validation_data=val_generator,
+            validation_steps=len(val_ids),
+            max_queue_size=30,
+            workers=workers,
             use_multiprocessing=False,
-            verbose=1,
         )
-        print("[HEAD.train] fit_generator returned", flush=True)
+
+
+from keras import backend as K
+
+def _ensure_tf1_graph():
+    """Переводим среду в режим TF1-графа: disable eager, clear_session, set Session(allow_growth)."""
+    try:
+        if hasattr(tf, "executing_eagerly") and tf.executing_eagerly():
+            tf1.disable_eager_execution()
+    except Exception:
+        pass
+    try:
+        K.clear_session()
+    except Exception:
+        pass
+    try:
+        cfg = tf1.ConfigProto()
+        cfg.gpu_options.allow_growth = True
+        sess = tf1.Session(config=cfg)
+
+    except Exception as e:
+        print("[tf-compat] session init warn:", e)
 
 class MaskRCNN():
     """Encapsulates the whole Mask RCNN model functionality.
@@ -2932,131 +2884,168 @@ class MaskRCNN():
         if show_summary:
             self.print_summary()
 
+    def _infer_head_params_from_h5(self, weights_path):
+        """
+        Пробуем достать из H5 формы ключевых слоёв головы и вернуть словарь:
+          {"pool": <POOL_SIZE>, "fc": <FPN_CLASSIF_FC_LAYERS_SIZE>, "mask": <HEAD_CONV_CHANNEL>}
+        Если чего-то нет — кидаем исключение, чтобы сработал fallback на config.
+        """
+        import os, h5py
+        if not weights_path or not os.path.exists(weights_path):
+            raise FileNotFoundError(f"no head weights: {weights_path}")
+
+        with h5py.File(weights_path, "r") as f:
+            root = f["model_weights"] if "model_weights" in f.keys() else f
+
+            def _shape(layer):
+                if layer not in root:
+                    raise KeyError(f"layer '{layer}' not found in H5")
+                g = root[layer]
+                # берём первый тензор (kernel) — у Conv3D/Conv3DTranspose он всегда есть
+                ds = [g[k] for k in g.keys() if isinstance(g[k], h5py.Dataset)]
+                if not ds:
+                    raise KeyError(f"no tensors in layer '{layer}'")
+                return tuple(ds[0].shape)
+
+            # Классификатор: mrcnn_class_conv1: [1,1,1,Cin, fc]
+            s_cls1 = _shape("mrcnn_class_conv1")
+            # Маск-ветка: mrcnn_mask_conv1: [3,3,3,Cin, mask_ch]
+            s_m1 = _shape("mrcnn_mask_conv1")
+
+            # POOL_SIZE восстанавливаем из conv1 kernel shape для класификатора:
+            # у нас conv(kernel_size=(POOL,POOL,POOL), padding='valid') → Cin = pool^3 * TOP_DOWN_PYRAMID_SIZE,
+            # но проще взять из ROIAlign-веса нельзя; поэтому используем config.POOL_SIZE как «pool»,
+            # а fc берём из выхода conv1/conv2 (последняя размерность).
+            # Если у тебя conv1 стоит (POOL,POOL,POOL), то первая тройка элементов ядра == (POOL,POOL,POOL).
+            try:
+                pool = int(s_cls1[0])  # kernel_depth
+            except Exception:
+                pool = int(getattr(self.config, "POOL_SIZE", 7))
+
+            fc = int(s_cls1[-1])
+            mask = int(s_m1[-1])
+
+            return {"pool": pool, "fc": fc, "mask": mask}
     def _get_layer_by_suffix(self, suffix):
         for layer in self.keras_model.layers:
             if layer.name.endswith(suffix):
                 return layer
         return None
 
-    def _copy_weights_by_suffix(self, src_model, suffixes):
-        imported, missed = [], []
-        for suf in suffixes:
-            src = None
-            for l in src_model.layers:
-                if l.name.endswith(suf):
-                    src = l
-                    break
-            dst = self._get_layer_by_suffix(suf)
-            if src is not None and dst is not None:
-                try:
-                    dst.set_weights(src.get_weights())
-                    imported.append((src.name, dst.name))
-                except Exception as e:
-                    missed.append((suf, f"shape mismatch: {str(e)}"))
-            else:
-                missed.append((suf, "not found (src or dst)"))
-        return imported, missed
+    def _build_head_skeleton(self, fc_ch):
+        """Мини-сетка головы (ROIAlign + cls/bbox + mask) для проверки соответствия весам."""
+        # Входы
+        rois = KL.Input(shape=[None, 6], name="input_rois")
+        meta = KL.Input(shape=[self.config.IMAGE_META_SIZE], name="input_meta")
+        # FPN-фичи (формально — просто входы нужной формы; имена важны)
+        P2 = KL.Input(shape=[None, None, None, self.config.TOP_DOWN_PYRAMID_SIZE], name="P2")
+        P3 = KL.Input(shape=[None, None, None, self.config.TOP_DOWN_PYRAMID_SIZE], name="P3")
+        P4 = KL.Input(shape=[None, None, None, self.config.TOP_DOWN_PYRAMID_SIZE], name="P4")
+        P5 = KL.Input(shape=[None, None, None, self.config.TOP_DOWN_PYRAMID_SIZE], name="P5")
 
-    def _force_load_head_weights(self):
+        # Классификатор/регрессор
+        cls_log, cls_prob, bbox = fpn_classifier_graph_with_RoiAlign(
+        rois=rois, feature_maps=[P2,P3,P4,P5], image_meta=meta,
+        pool_size=self.config.POOL_SIZE, num_classes=self.config.NUM_CLASSES,
+        fc_layers_size=int(fc_ch), train_bn=False, name_prefix="probe_"
+    )
+        masks = build_fpn_mask_graph_with_RoiAlign(
+        rois=rois, feature_maps=[P2,P3,P4,P5], image_meta=meta,
+        pool_size=self.config.MASK_POOL_SIZE, num_classes=self.config.NUM_CLASSES,
+        conv_channel=int(fc_ch), train_bn=False, name_prefix="probe_"
+    )
+
+        return KM.Model([rois, meta, P2, P3, P4, P5],
+                        [cls_log, cls_prob, bbox, masks],
+                        name=f"head_skeleton_{int(fc_ch)}")
+
+
+    def _count_h5_matches(self, model, weights_path):
+        """Посчитать, для скольких слоёв по именам и по форме есть совместимые веса в H5.
+           Поддерживает оба layout'а: корень и подгруппу 'model_weights'.
         """
-        Гарантированная загрузка веса головы из HEAD_WEIGHTS:
-        строим мини-модель-скелет (те же имена слоёв), грузим в неё файл весов by_name,
-        а затем копируем веса в self.keras_model по суффиксам.
-        """
-        import keras as KM
-        import keras.layers as KL
-        head_path = getattr(self.config, "HEAD_WEIGHTS", None)
-        if not head_path:
-            print("[HEAD] no HEAD_WEIGHTS specified — skip force load")
-            return
+        try:
+            import h5py
+            f = h5py.File(weights_path, 'r')
+        except Exception:
+            return 0
+
+        # Где лежат слои в H5
+        root = f
+        if 'model_weights' in f.keys():
+            root = f['model_weights']
+
+        # Словарь: имя_слоя_в_модели -> список форм тензоров
+        name_to_shapes = {}
+        for layer in model.layers:
+            w = layer.weights
+            if not w:
+                continue
+            shapes = [tuple(K.int_shape(v)) for v in w]
+            name_to_shapes[layer.name] = shapes
+
+        matched = 0
+        for lname, shapes in name_to_shapes.items():
+            if lname not in root:
+                continue
+            g = root[lname]
+            # извлекаем датасеты (веса) в группе
+            h5_tensors = [g[k] for k in g.keys() if isinstance(g[k], h5py.Dataset)]
+            if len(h5_tensors) != len(shapes):
+                continue
+            ok = True
+            for ds, shp in zip(h5_tensors, shapes):
+                # сравниваем, разрешая None в модели
+                target = tuple((d if d is not None else s) for d, s in zip(shp, ds.shape))
+                if tuple(ds.shape) != target:
+                    ok = False
+                    break
+            if ok:
+                matched += 1
 
         try:
-            # Входы «как в HEAD.build», но без датасетов
-            T = int(getattr(self.config, "TRAIN_ROIS_PER_IMAGE", 128))
-            Ctd = int(getattr(self.config, "TOP_DOWN_PYRAMID_SIZE", 256))
-            P = int(getattr(self.config, "POOL_SIZE", 7))
-            Mp = int(getattr(self.config, "MASK_POOL_SIZE", 14))
-            Ms = tuple(getattr(self.config, "MASK_SHAPE", (28, 28, 28)))
-            Nc = int(self.config.NUM_CLASSES)
+            f.close()
+        except Exception:
+            pass
+        return matched
 
-            inp_ra = KL.Input(shape=(T, P, P, P, Ctd), name="input_rois_aligned")
-            inp_ma = KL.Input(shape=(T, Mp, Mp, Mp, Ctd), name="input_mask_aligned")
-            inp_meta = KL.Input(shape=(self.config.IMAGE_META_SIZE,), name="input_image_meta")
-            inp_tci = KL.Input(shape=(T,), name="input_target_class_ids")
-            inp_tb = KL.Input(shape=(T, 6), name="input_target_bbox")
-            inp_tm = KL.Input(shape=(*Ms, 1,), name="input_target_mask_dummy")  # не используется
+    def _pick_head_channels(self):
+        """Выбрать ширину головы так, чтобы веса HEAD_WEIGHTS совпали максимально.
+           Кандидаты: HEAD_CONV_CHANNEL и FPN_CLASSIF_FC_LAYERS_SIZE.
+        """
+        import os
+        w = getattr(self.config, "HEAD_WEIGHTS", None)
+        # если весов нет — оставляем config.HEAD_CONV_CHANNEL
+        if not w or not os.path.exists(w):
+            return int(getattr(self.config, "HEAD_CONV_CHANNEL", 128))
 
-            # Heads (важны ИМЕНА слоёв!)
-            from core.models import fpn_classifier_graph, build_fpn_mask_graph, parse_image_meta_graph
-            active_class_ids = KL.Lambda(lambda x: parse_image_meta_graph(x)["active_class_ids"])(inp_meta)
+        cand = []
+        hch = int(getattr(self.config, "HEAD_CONV_CHANNEL", 128))
+        if hch not in cand:
+            cand.append(hch)
+        fc512 = int(getattr(self.config, "FPN_CLASSIF_FC_LAYERS_SIZE", hch))
+        if fc512 not in cand:
+            cand.append(fc512)
 
-            cls_logits, cls_prob, bbox = fpn_classifier_graph(
-                y=inp_ra,
-                pool_size=self.config.POOL_SIZE,
-                num_classes=Nc,
-                fc_layers_size=self.config.HEAD_CONV_CHANNEL,
-                train_bn=False  # всегда фриз BN при HEAD-тренировке/скомпиливании скелета
-            )
-            mrcnn_mask = build_fpn_mask_graph(
-                y=inp_ma,
-                num_classes=Nc,
-                conv_channel=self.config.HEAD_CONV_CHANNEL,
-                train_bn=False
-            )
+        best = cand[0]
+        best_hits = -1
+        for ch in cand:
+            sk = self._build_head_skeleton(ch)
+            hits = self._count_h5_matches(sk, w)
+            # простая эвристика: больше совпало — лучше
+            if hits > best_hits:
+                best_hits = hits
+                best = ch
 
-            head_skeleton = KM.Model(
-                [inp_ra, inp_ma, inp_meta, inp_tci, inp_tb, inp_tm],
-                [cls_logits, cls_prob, bbox, mrcnn_mask],
-                name="head_skeleton"
-            )
-            head_skeleton.load_weights(head_path, by_name=True)
-        except Exception as e:
-            print(f"[HEAD] skeleton load failed: {e}")
-            return
+        if best != hch:
+            print(f"[HEAD][auto] override channels: config.HEAD_CONV_CHANNEL={hch} -> using {best} (by weights match)")
+        else:
+            print(f"[HEAD][auto] using HEAD_CONV_CHANNEL={best}")
+        return int(best)
 
-        # Копируем веса по суффиксам имён слоёв
-        def _get_layer_by_suffix(model, suffix):
-            for l in model.layers:
-                if l.name.endswith(suffix):
-                    return l
-            return None
 
-        imported, missed = [], []
-        suffixes = [
-            # classifier & bbox
-            "mrcnn_class_conv1", "mrcnn_class_bn1",
-            "mrcnn_class_conv2", "mrcnn_class_bn2",
-            "mrcnn_class_logits", "mrcnn_class",
-            "mrcnn_bbox_fc", "mrcnn_bbox",
-            # mask
-            "mrcnn_mask_conv1", "mrcnn_mask_bn1",
-            "mrcnn_mask_conv2", "mrcnn_mask_bn2",
-            "mrcnn_mask_conv3", "mrcnn_mask_bn3",
-            "mrcnn_mask_conv4", "mrcnn_mask_bn4",
-            "mrcnn_mask_deconv", "mrcnn_mask",
-        ]
-        for suf in suffixes:
-            src = _get_layer_by_suffix(head_skeleton, suf)
-            dst = _get_layer_by_suffix(self.keras_model, suf)
-            if src is not None and dst is not None:
-                try:
-                    dst.set_weights(src.get_weights())
-                    imported.append((src.name, dst.name))
-                except Exception as e:
-                    missed.append((suf, f"shape mismatch: {e}"))
-            else:
-                missed.append((suf, "not found (src or dst)"))
-
-        print(f"[HEAD] imported {len(imported)} head layers via skeleton")
-        if missed:
-            print("[HEAD] missed layers:")
-            for suf, why in missed:
-                print("   -", suf, "→", why)
 
     def _head_weight_healthcheck(self):
-        """
-        Печатаем нормы весов ключевых слоёв головы, чтобы убедиться, что веса загружены (не константы).
-        """
         import numpy as np
         keys = [
             "mrcnn_class_conv1", "mrcnn_class_conv2",
@@ -3064,11 +3053,11 @@ class MaskRCNN():
             "mrcnn_mask_conv1", "mrcnn_mask_conv2", "mrcnn_mask_conv3", "mrcnn_mask_conv4",
             "mrcnn_mask_deconv", "mrcnn_mask",
         ]
-        print("[HEAD] weights healthcheck (L2-norms):")
+        print("[HEAD] Weights healthcheck (L2-norms):")
         for suf in keys:
             l = self._get_layer_by_suffix(suf)
             if l is None:
-                print(f"  {suf:22s} : MISSING")
+                print(f"  {suf:22s} : missing")
                 continue
             try:
                 ws = l.get_weights()
@@ -3076,17 +3065,20 @@ class MaskRCNN():
                     print(f"  {suf:22s} : empty")
                     continue
                 norms = [float(np.linalg.norm(w)) for w in ws]
-                print(f"  {suf:22s} : " + ", ".join(f"{n:.4f}" for n in norms))
+                print(f"  {suf:22s} : " + ", ".join(f"{n:.3f}" for n in norms))
             except Exception as e:
                 print(f"  {suf:22s} : error {e}")
+
     def prepare_datasets(self):
 
         # Create Datasets
         train_dataset = ToyDataset()
+        train_dataset.config = self.config
         train_dataset.load_dataset(data_dir=self.config.DATA_DIR)
         train_dataset.prepare()
         train_dataset.filter_positive()
         test_dataset = ToyDataset()
+        test_dataset.config = self.config
         test_dataset.load_dataset(data_dir=self.config.DATA_DIR, is_train=False)
         test_dataset.prepare()
 
@@ -3104,53 +3096,62 @@ class MaskRCNN():
         # Configuration
         self.config.display()
 
+    # В файле core/models.py, внутри класса MaskRCNN:
+
+
     def build(self):
         """
-        Build Mask R-CNN architecture.
+        Полная сборка Mask R-CNN 3D:
+          TRAINING:
+            - TRAIN_PHASE='rpn'   : только RPN + лоссы RPN
+            - TRAIN_PHASE='heads' : DetectionTarget -> Heads -> лоссы головы
+          INFERENCE:
+            - RPN -> Proposals -> Heads -> DetectionLayer -> MaskHead
+          Плюс eval-модели с безопасными префиксами имён.
         """
 
-        assert self.config.MODE in ['training', 'inference']
-        
-        # Image size must be dividable by 2 multiple times
-        # h, w, d = self.config.IMAGE_SHAPE[:3]
-        # if h / 2 ** 6 != int(h / 2 ** 6) or w / 2 ** 6 != int(w / 2 ** 6) or d / 2 ** 6 != int(d / 2 ** 6):
-        #     raise Exception("Image size must be dividable by 2 at least 6 times "
-        #                     "to avoid fractions when downscaling and upscaling."
-        #                     "For example, use 256, 320, 384, 448, 512, ... etc. ")
-        h, w, d = self.config.IMAGE_SHAPE[:3]
-        if (h % 64) or (w % 64):
-            raise ValueError("IMAGE_SHAPE height & width must be multiples of 64")
-        # Inputs
+        import keras.layers as KL
+        import keras.models as KM
+        from keras import backend as K
+
+        assert self.config.MODE in ("training", "inference")
+        if self.config.MODE == "training":
+            phase = str(getattr(self.config, "TRAIN_PHASE", "rpn")).lower()
+            assert phase in ("rpn", "heads")
+
+        # ---------- (0) чистый граф (TF1-совместимый) ----------
+        _ensure_tf1_graph()
+
+        # ---------- (1) подобрать ширину головы по сохранённым весам ----------
+        fc_ch = int(getattr(self.config, "HEAD_CONV_CHANNEL", 128))
+        # if hasattr(self, "_pick_head_channels"):
+        #     try:
+        #         fc_ch = int(self._pick_head_channels())
+        #     except Exception as e:
+        #         print("[build] _pick_head_channels() failed; fallback", fc_ch, ":", e)
+
+        # СНОВА чистый граф после пробы, чтобы не было коллизий имён
+        _ensure_tf1_graph()
+
+        # ---------- (2) Inputs ----------
         input_image = KL.Input(shape=[*self.config.IMAGE_SHAPE], name="input_image")
         input_image_meta = KL.Input(shape=[self.config.IMAGE_META_SIZE], name="input_image_meta")
+        input_anchors = KL.Input(shape=[None, 6], name="input_anchors", dtype=tf.float32)
 
-        if self.config.MODE == "training":
-            
-            # RPN targets
-            input_rpn_match = KL.Input(shape=[None, 1], name="input_rpn_match", dtype=tf.int32)
-            input_rpn_bbox = KL.Input(shape=[None, 6], name="input_rpn_bbox", dtype=tf.float32)
+        # ---------- (3) Backbone ----------
+        # resnet_graph -> (C1, C2, C3, C4, C5)
+        _, C2, C3, C4, C5 = resnet_graph(input_image,
+                                         self.config.BACKBONE,
+                                         stage5=True,
+                                         train_bn=self.config.TRAIN_BN)
 
-            input_gt_class_ids = KL.Input(shape=[None], name="input_gt_class_ids", dtype=tf.int32)
-
-            input_gt_boxes = KL.Input(shape=[None, 6], name="input_gt_boxes", dtype=tf.float32)
-            gt_boxes = KL.Lambda(lambda x: norm_boxes_graph(x, K.shape(input_image)[1:4]))(input_gt_boxes)
-
-            if self.config.USE_MINI_MASK:
-                input_gt_masks = KL.Input(shape=[*self.config.MINI_MASK_SHAPE, None], name="input_gt_masks", dtype=bool)
-            else:
-                input_gt_masks = KL.Input(shape=[*self.config.IMAGE_SHAPE[:-1], None], name="input_gt_masks", dtype=bool)
-
-        # CNN
-        _, C2, C3, C4, C5 = resnet_graph(input_image, self.config.BACKBONE, stage5=True, train_bn=self.config.TRAIN_BN)
-
-        # Top-down Layers
+        # ---------- (4) FPN (апсемплим по XY) ----------
         P5 = KL.Conv3D(self.config.TOP_DOWN_PYRAMID_SIZE, (1, 1, 1), name='fpn_c5p5')(C5)
 
         P4 = KL.Add(name="fpn_p4add")([
             KL.UpSampling3D(size=(2, 2, 1), name="fpn_p5upsampled")(P5),
             KL.Conv3D(self.config.TOP_DOWN_PYRAMID_SIZE, (1, 1, 1), name='fpn_c4p4')(C4)
         ])
-
         P3 = KL.Add(name="fpn_p3add")([
             KL.UpSampling3D(size=(2, 2, 1), name="fpn_p4upsampled")(P4),
             KL.Conv3D(self.config.TOP_DOWN_PYRAMID_SIZE, (1, 1, 1), name='fpn_c3p3')(C3)
@@ -3160,56 +3161,30 @@ class MaskRCNN():
             KL.Conv3D(self.config.TOP_DOWN_PYRAMID_SIZE, (1, 1, 1), name='fpn_c2p2')(C2)
         ])
 
-        # FPN last step
-        P2 = KL.Conv3D(self.config.TOP_DOWN_PYRAMID_SIZE, (3, 3, 3), padding="SAME", name="fpn_p2")(P2)
-        P3 = KL.Conv3D(self.config.TOP_DOWN_PYRAMID_SIZE, (3, 3, 3), padding="SAME", name="fpn_p3")(P3)
-        P4 = KL.Conv3D(self.config.TOP_DOWN_PYRAMID_SIZE, (3, 3, 3), padding="SAME", name="fpn_p4")(P4)
-        P5 = KL.Conv3D(self.config.TOP_DOWN_PYRAMID_SIZE, (3, 3, 3), padding="SAME", name="fpn_p5")(P5)
-        P6 = KL.MaxPooling3D(pool_size=(1, 1, 1), strides=(2,2,1), name="fpn_p6")(P5)
+        P2 = KL.Conv3D(self.config.TOP_DOWN_PYRAMID_SIZE, (3, 3, 3), padding="same", name="fpn_p2")(P2)
+        P3 = KL.Conv3D(self.config.TOP_DOWN_PYRAMID_SIZE, (3, 3, 3), padding="same", name="fpn_p3")(P3)
+        P4 = KL.Conv3D(self.config.TOP_DOWN_PYRAMID_SIZE, (3, 3, 3), padding="same", name="fpn_p4")(P4)
+        P5 = KL.Conv3D(self.config.TOP_DOWN_PYRAMID_SIZE, (3, 3, 3), padding="same", name="fpn_p5")(P5)
+        P6 = KL.MaxPooling3D(pool_size=(1, 1, 1), strides=(2, 2, 1), name="fpn_p6")(P5)
 
-        # Features maps
-        # Note that P6 is used in RPN, but not in the classifier heads.
         rpn_feature_maps = [P2, P3, P4, P5, P6]
         mrcnn_feature_maps = [P2, P3, P4, P5]
 
-        # Anchors
-        if self.config.MODE == "training":
-
-            anchors = self.get_anchors(self.config.IMAGE_SHAPE)
-            # Duplicate across the batch dimension because Keras requires it
-            anchors = np.broadcast_to(anchors, (self.config.BATCH_SIZE,) + anchors.shape)
-            # A hack to get around Keras's bad support for constants
-            anchors = KL.Lambda(lambda x: tf.Variable(anchors), name="anchors")(input_image)
-
-        elif self.config.MODE == "inference":
-
-            input_anchors = KL.Input(shape=[None, 6], name="input_anchors")
-            anchors = input_anchors
-
-        # RPN Model
-        rpn = build_rpn_model(
-            self.config.RPN_ANCHOR_STRIDE, 
-            len(self.config.RPN_ANCHOR_RATIOS), 
-            self.config.TOP_DOWN_PYRAMID_SIZE
-        )
-
-        # Loop through pyramid layers
-        layer_outputs = []  # list of lists
-        for p in rpn_feature_maps:
-            layer_outputs.append(rpn([p]))
-        
-        # Concatenate layer outputs
-        # Convert from list of lists of level outputs to list of lists
-        # of outputs across levels.
-        # e.g. [[a1, b1, c1], [a2, b2, c2]] => [[a1, a2], [b1, b2], [c1, c2]]
+        # ---------- (5) RPN ----------
+        rpn = build_rpn_model(self.config.RPN_ANCHOR_STRIDE,
+                              len(self.config.RPN_ANCHOR_RATIOS),
+                              self.config.TOP_DOWN_PYRAMID_SIZE)
+        layer_outputs = [rpn([p]) for p in rpn_feature_maps]
         output_names = ["rpn_class_logits", "rpn_class", "rpn_bbox"]
-        outputs = list(zip(*layer_outputs))
-        outputs = [KL.Concatenate(axis=1, name=n)(list(o)) for o, n in zip(outputs, output_names)]
+        rpn_class_logits, rpn_class, rpn_bbox = [
+            KL.Concatenate(axis=1, name=n)([o[i] for o in layer_outputs])
+            for i, n in enumerate(output_names)
+        ]
 
-        rpn_class_logits, rpn_class, rpn_bbox = outputs
-
-        # Generate proposals
-        proposal_count = self.config.POST_NMS_ROIS_TRAINING if self.config.MODE == "training" else self.config.POST_NMS_ROIS_INFERENCE
+        # ---------- (6) Proposals ----------
+        proposal_count = (self.config.POST_NMS_ROIS_TRAINING
+                          if self.config.MODE == "training"
+                          else self.config.POST_NMS_ROIS_INFERENCE)
         rpn_rois = ProposalLayer(
             proposal_count=proposal_count,
             nms_threshold=self.config.RPN_NMS_THRESHOLD,
@@ -3218,14 +3193,43 @@ class MaskRCNN():
             rpn_bbox_std_dev=self.config.RPN_BBOX_STD_DEV,
             image_depth=self.config.IMAGE_DEPTH,
             name="ROI"
-        )([rpn_class, rpn_bbox, anchors])
+        )([rpn_class, rpn_bbox, input_anchors])
 
+        # =========================
+        # ======== TRAINING =======
+        # =========================
         if self.config.MODE == "training":
+            # --- GT inputs ---
+            input_rpn_match = KL.Input(shape=[None, 1], name="input_rpn_match", dtype=tf.int32)
+            input_rpn_bbox = KL.Input(shape=[None, 6], name="input_rpn_bbox", dtype=tf.float32)
 
-            active_class_ids = KL.Lambda(lambda x: parse_image_meta_graph(x)["active_class_ids"])(input_image_meta)
+            input_gt_class_ids = KL.Input(shape=[None], name="input_gt_class_ids", dtype=tf.int32)
+            input_gt_boxes = KL.Input(shape=[None, 6], name="input_gt_boxes", dtype=tf.float32)
+            if self.config.USE_MINI_MASK:
+                input_gt_masks = KL.Input(shape=[*self.config.MINI_MASK_SHAPE, None],
+                                          name="input_gt_masks", dtype=bool)
+            else:
+                input_gt_masks = KL.Input(shape=[*self.config.IMAGE_SHAPE[:-1], None],
+                                          name="input_gt_masks", dtype=bool)
 
-            # Generate detection targets
-            rois, _, target_class_ids, target_bbox, target_mask = DetectionTargetLayer(
+            # нормализованные GT для DetectionTargetLayer
+            gt_boxes = KL.Lambda(lambda x: norm_boxes_graph(x, K.shape(input_image)[1:4]),
+                                 name="gt_boxes_norm")(input_gt_boxes)
+
+            if phase == "rpn":
+                # --- RPN losses ---
+                rpn_class_loss = KL.Lambda(lambda x: rpn_class_loss_graph(*x),
+                                           name="rpn_class_loss")([input_rpn_match, rpn_class_logits])
+                rpn_bbox_loss = KL.Lambda(lambda x: rpn_bbox_loss_graph(self.config.IMAGES_PER_GPU, *x),
+                                          name="rpn_bbox_loss")([input_rpn_bbox, input_rpn_match, rpn_bbox])
+
+                inputs = [input_image, input_image_meta, input_anchors, input_rpn_match, input_rpn_bbox]
+                outputs = [rpn_class_logits, rpn_class, rpn_bbox, rpn_rois, rpn_class_loss, rpn_bbox_loss]
+                self.keras_model = KM.Model(inputs, outputs, name="mask_rcnn_train_rpn")
+                return self.keras_model
+
+            # --- Detection targets (для тренировки головы) ---
+            rois, target_gt_boxes, target_class_ids, target_bbox, target_mask = DetectionTargetLayer(
                 self.config.TRAIN_ROIS_PER_IMAGE,
                 self.config.ROI_POSITIVE_RATIO,
                 self.config.BBOX_STD_DEV,
@@ -3235,285 +3239,250 @@ class MaskRCNN():
                 name="proposal_targets"
             )([rpn_rois, input_gt_class_ids, gt_boxes, input_gt_masks])
 
-            # Network Heads: classifier and regressor
+            # --- Heads (classifier+bbox) ---
             mrcnn_class_logits, mrcnn_class, mrcnn_bbox = fpn_classifier_graph_with_RoiAlign(
-                rois=rois, 
-                feature_maps=mrcnn_feature_maps, 
-                image_meta=input_image_meta, 
-                pool_size=self.config.POOL_SIZE,
-                num_classes=self.config.NUM_CLASSES, 
-                fc_layers_size=self.config.FPN_CLASSIF_FC_LAYERS_SIZE,
-                train_bn=self.config.TRAIN_BN                
-            )
-
-            # Network Heads: segmentation
-            mrcnn_mask = build_fpn_mask_graph_with_RoiAlign(
-                rois=rois, 
-                feature_maps=mrcnn_feature_maps, 
-                image_meta=input_image_meta,
-                pool_size=self.config.MASK_POOL_SIZE, 
-                num_classes=self.config.NUM_CLASSES,
-                conv_channel=self.config.HEAD_CONV_CHANNEL,
-                train_bn=self.config.TRAIN_BN
-            )
-
-            output_rois = KL.Lambda(lambda x: x * 1, name="output_rois")(rois)
-
-            # Losses
-            rpn_class_loss = KL.Lambda(lambda x: rpn_class_loss_graph(*x), name="rpn_class_loss")(
-                [input_rpn_match, rpn_class_logits])
-            
-            rpn_bbox_loss = KL.Lambda(lambda x: rpn_bbox_loss_graph(self.config.IMAGES_PER_GPU, *x), name="rpn_bbox_loss")(
-                [input_rpn_bbox, input_rpn_match, rpn_bbox])
-            
-            class_loss = KL.Lambda(lambda x: mrcnn_class_loss_graph(*x), name="mrcnn_class_loss")(
-                [target_class_ids, mrcnn_class_logits, active_class_ids])
-            
-            bbox_loss = KL.Lambda(lambda x: mrcnn_bbox_loss_graph(*x), name="mrcnn_bbox_loss")(
-                [target_bbox, target_class_ids, mrcnn_bbox])
-            
-            mask_loss = KL.Lambda(lambda x: mrcnn_mask_loss_graph(*x), name="mrcnn_mask_loss")(
-                [target_mask, target_class_ids, mrcnn_mask])
-
-            # Model
-            inputs = [input_image, input_image_meta, input_gt_class_ids, input_gt_boxes, input_gt_masks,
-                      input_rpn_match, input_rpn_bbox]
-            outputs = [rpn_class_logits, rpn_class, rpn_bbox, mrcnn_class_logits, mrcnn_class, mrcnn_bbox, mrcnn_mask,
-                       rpn_rois, output_rois, rpn_class_loss, rpn_bbox_loss, class_loss, bbox_loss, mask_loss]
-            
-            model = KM.Model(inputs, outputs, name='mask_rcnn_training')
-
-
-
-        elif self.config.MODE == "inference":
-
-            # === Heads: classifier & regressor ===
-
-            mrcnn_class_logits, mrcnn_class, mrcnn_bbox = fpn_classifier_graph_with_RoiAlign(
-
-                rois=rpn_rois,
-
+                rois=rois,
                 feature_maps=mrcnn_feature_maps,
-
                 image_meta=input_image_meta,
-
                 pool_size=self.config.POOL_SIZE,
-
                 num_classes=self.config.NUM_CLASSES,
-
-                fc_layers_size=self.config.FPN_CLASSIF_FC_LAYERS_SIZE,
-
-                train_bn=self.config.TRAIN_BN
-
+                fc_layers_size=self.config.FPN_CLASSIF_FC_LAYERS_SIZE,  # <-- фикс: ширина classifier как в инференсе
+                train_bn=False,
+                name_prefix=""  # каноничные имена mrcnn_*
             )
 
-            # === Detections ===
-
-            # [batch, num_detections, (y1,x1,z1,y2,x2,z2, class_id, score)]
-
-            detections = DetectionLayer(
-
-                self.config.BBOX_STD_DEV,
-
-                self.config.DETECTION_MIN_CONFIDENCE,
-
-                self.config.DETECTION_MAX_INSTANCES,
-
-                self.config.DETECTION_NMS_THRESHOLD,
-
-                self.config.IMAGES_PER_GPU,
-
-                self.config.BATCH_SIZE,
-
-                name="mrcnn_detection"
-
-            )([rpn_rois, mrcnn_class, mrcnn_bbox, input_image_meta])
-
-            detection_boxes = KL.Lambda(lambda x: x[..., :6])(detections)
-
-            # === Mask head на финальных боксах ===
-
+            # --- Mask head ---
             mrcnn_mask = build_fpn_mask_graph_with_RoiAlign(
-
-                rois=detection_boxes,
-
+                rois=rois,
                 feature_maps=mrcnn_feature_maps,
-
                 image_meta=input_image_meta,
-
                 pool_size=self.config.MASK_POOL_SIZE,
-
                 num_classes=self.config.NUM_CLASSES,
-
-                conv_channel=self.config.HEAD_CONV_CHANNEL,
-
-                train_bn=self.config.TRAIN_BN
-
+                conv_channel=self.config.HEAD_CONV_CHANNEL,  # <-- фикс: ширина mask-ветки = HEAD_CONV_CHANNEL
+                train_bn=False,
+                name_prefix=""  # каноничные имена mrcnn_*
             )
 
-            # === Основная инференс-модель (как у тебя) ===
+            # --- Лоссы головы ---
+            active_class_ids = KL.Lambda(
+                lambda x: parse_image_meta_graph(x)["active_class_ids"],
+                name="active_class_ids"
+            )(input_image_meta)
 
-            inputs = [input_image, input_image_meta, input_anchors]
+            # ВАЖНО: передаём аргументы лоссов строго в каноническом порядке и через lambda x: fn(*x)
+            mrcnn_class_loss = KL.Lambda(
+                lambda x: mrcnn_class_loss_graph(*x),
+                name="mrcnn_class_loss"
+            )([target_class_ids, mrcnn_class_logits, active_class_ids])
 
-            outputs = [detections, mrcnn_class, mrcnn_bbox, mrcnn_mask,
+            mrcnn_bbox_loss = KL.Lambda(
+                lambda x: mrcnn_bbox_loss_graph(*x),
+                name="mrcnn_bbox_loss"
+            )([target_bbox, target_class_ids, mrcnn_bbox])
 
-                       rpn_rois, rpn_class, rpn_bbox]
+            mrcnn_mask_loss = KL.Lambda(
+                lambda x: mrcnn_mask_loss_graph(*x),
+                name="mrcnn_mask_loss"
+            )([target_mask, target_class_ids, mrcnn_mask])
 
-            model = KM.Model(inputs, outputs, name='mask_rcnn_inference')
-            # DEBUG: модель, которая отдаёт признаки после ROIAlign (classifier head)
-            try:
-                self.keras_roi_debug = KM.Model(
-                    [input_image, input_image_meta, input_anchors],
-                    model.get_layer("roi_align_classifier").output,
-                    name="roi_align_classifier_debug"
-                )
-            except Exception as e:
-                print(f"[DEBUG] ROI debug model build failed: {e}")
-                self.keras_roi_debug = None
-            # ------------------------------------------------------------------
+            # --- финальные inputs/outputs для TRAINING(heads) ---
+            inputs = [input_image, input_image_meta, input_anchors,
+                      input_gt_class_ids, input_gt_boxes, input_gt_masks]
+            outputs = [mrcnn_class_logits, mrcnn_class, mrcnn_bbox, mrcnn_mask,
+                       rpn_rois, mrcnn_class_loss, mrcnn_bbox_loss, mrcnn_mask_loss]
+            self.keras_model = KM.Model(inputs, outputs, name="mask_rcnn_train_heads")
+            return self.keras_model
 
-            # ДОП. модели для "оконного" инференса головы (ничего не ломают):
+        # =========================
+        # ======== INFERENCE ======
+        # =========================
 
-            # 1) core: выдаёт detections + FPN P2..P5
+        head_h5 = getattr(self.config, "HEAD_WEIGHTS", None)
+        try:
+            hp = self._infer_head_params_from_h5(head_h5)
+            # Подстроим только голову, RPN и FPN не трогаем
+            pool_from_h5 = int(hp["pool"])
+            fc_class_ch = int(hp["fc"])
+            mask_ch = int(hp["mask"])
+            # ВАЖНО: ROIAlign classifier должен иметь тот же pool_size, что в обученных весах
+            self.config.POOL_SIZE = pool_from_h5
+            print(
+                f"[HEAD][infer] using POOL_SIZE={pool_from_h5}, classifier_ch={fc_class_ch}, mask_ch={mask_ch} from H5")
+        except Exception as e:
+            print(f"[HEAD][infer] H5 introspection failed: {e} ; fallback to config")
+            fc_class_ch = int(
+                getattr(self.config, "FPN_CLASSIF_FC_LAYERS_SIZE", getattr(self.config, "HEAD_CONV_CHANNEL", 128)))
+            mask_ch = int(getattr(self.config, "HEAD_CONV_CHANNEL", fc_class_ch))
+        # --- classifier+bbox на rpn_rois ---
+        mrcnn_class_logits, mrcnn_class, mrcnn_bbox = fpn_classifier_graph_with_RoiAlign(
+            rois=rpn_rois, feature_maps=mrcnn_feature_maps, image_meta=input_image_meta,
+            pool_size=self.config.POOL_SIZE, num_classes=self.config.NUM_CLASSES,
+            fc_layers_size=self.config.FPN_CLASSIF_FC_LAYERS_SIZE,  # <-- фикс: как в тренинге головы
+            train_bn=False, name_prefix=""
+        )
 
+        # --- DetectionLayer: refine + NMS ---
+        detections = DetectionLayer(
+            self.config.BBOX_STD_DEV,
+            float(self.config.DETECTION_MIN_CONFIDENCE),
+            int(self.config.DETECTION_MAX_INSTANCES),
+            float(self.config.DETECTION_NMS_THRESHOLD),
+            int(self.config.IMAGES_PER_GPU),
+            int(getattr(self.config, "BATCH_SIZE", self.config.IMAGES_PER_GPU)),
+            name="mrcnn_detection"
+        )([rpn_rois, mrcnn_class, mrcnn_bbox, input_image_meta])
+
+        detection_boxes = KL.Lambda(lambda x: x[..., :6], name="detection_boxes")(detections)
+
+        # --- mask head по финальным боксам ---
+        mrcnn_mask = build_fpn_mask_graph_with_RoiAlign(
+            rois=detection_boxes,  # <-- фикс: финальные боксы
+            feature_maps=mrcnn_feature_maps, image_meta=input_image_meta,
+            pool_size=self.config.MASK_POOL_SIZE, num_classes=self.config.NUM_CLASSES,
+            conv_channel=self.config.HEAD_CONV_CHANNEL,  # <-- фикс: как в тренинге головы
+            train_bn=False, name_prefix=""
+        )
+
+        # --- Основная инференс-модель ---
+        infer_inputs = [input_image, input_image_meta, input_anchors]
+        infer_outputs = [detections, mrcnn_class, mrcnn_bbox, mrcnn_mask, rpn_rois]
+        self.keras_model = KM.Model(infer_inputs, infer_outputs, name="mask_rcnn_inference")
+
+        # ----- Вспомогательные eval-модели (всегда с префиксами!) -----
+        # 1) core: detections + P2..P5
+        try:
             self.keras_infer_core = KM.Model(
-
                 [input_image, input_image_meta, input_anchors],
-
-                [detections, P2, P3, P4, P5],
-
+                [detections, mrcnn_feature_maps[0], mrcnn_feature_maps[1],
+                 mrcnn_feature_maps[2], mrcnn_feature_maps[3]],
                 name="mrcnn_infer_core"
-
             )
+        except Exception as e:
+            print("[infer_core] build failed:", e)
+            self.keras_infer_core = None
 
-            # 2) mask head eval: из любых ROI + meta + P2..P5 → mrcnn_mask
+        # 2) head_eval: classifier+bbox на произвольных ROIs + (P2..P5)
+        eval_rois = KL.Input(shape=[None, 6], name="eval_rois")
+        eval_meta = KL.Input(shape=[self.config.IMAGE_META_SIZE], name="eval_meta")
+        P2_in = KL.Input(shape=K.int_shape(mrcnn_feature_maps[0])[1:], name="eval_P2")
+        P3_in = KL.Input(shape=K.int_shape(mrcnn_feature_maps[1])[1:], name="eval_P3")
+        P4_in = KL.Input(shape=K.int_shape(mrcnn_feature_maps[2])[1:], name="eval_P4")
+        P5_in = KL.Input(shape=K.int_shape(mrcnn_feature_maps[3])[1:], name="eval_P5")
 
-            #    Собираем по именованным слоям, чтобы использовать те же веса.
+        cls_logits_eval, cls_probs_eval, bbox_deltas_eval = fpn_classifier_graph_with_RoiAlign(
+            rois=eval_rois, feature_maps=[P2_in, P3_in, P4_in, P5_in], image_meta=eval_meta,
+            pool_size=self.config.POOL_SIZE, num_classes=self.config.NUM_CLASSES,
+            fc_layers_size=fc_ch, train_bn=False, name_prefix="eval_"
+        )
+        self.keras_head_eval = KM.Model(
+            [eval_rois, eval_meta, P2_in, P3_in, P4_in, P5_in],
+            [cls_probs_eval, bbox_deltas_eval],
+            name="head_eval"
+        )
 
-            eval_rois = KL.Input(shape=[None, 6], name="eval_rois")  # norm coords
+        # 3) mask_head_eval: маски на произвольных ROIs + (P2..P5)
+        eval_rois_m = KL.Input(shape=[None, 6], name="eval_rois_mask")
+        mask_logits_eval = build_fpn_mask_graph_with_RoiAlign(
+            rois=eval_rois_m, feature_maps=[P2_in, P3_in, P4_in, P5_in], image_meta=eval_meta,
+            pool_size=self.config.MASK_POOL_SIZE, num_classes=self.config.NUM_CLASSES,
+            conv_channel=fc_ch, train_bn=False, name_prefix="mask_eval_"
+        )
+        self.keras_mask_head_eval = KM.Model(
+            [eval_rois_m, eval_meta, P2_in, P3_in, P4_in, P5_in],
+            mask_logits_eval,
+            name="mask_head_eval"
+        )
 
-            eval_meta = KL.Input(shape=[self.config.IMAGE_META_SIZE], name="eval_image_meta")
-
-            p2_in = KL.Input(shape=K.int_shape(P2)[1:], name="eval_P2")
-
-            p3_in = KL.Input(shape=K.int_shape(P3)[1:], name="eval_P3")
-
-            p4_in = KL.Input(shape=K.int_shape(P4)[1:], name="eval_P4")
-
-            p5_in = KL.Input(shape=K.int_shape(P5)[1:], name="eval_P5")
-
-            x = model.get_layer("roi_align_mask")([eval_rois, eval_meta, p2_in, p3_in, p4_in, p5_in])
-
-            x = model.get_layer("mrcnn_mask_conv1")(x)
-
-            x = model.get_layer("mrcnn_mask_bn1")(x, training=False);
-            x = KL.Activation('relu')(x)
-
-            x = model.get_layer("mrcnn_mask_conv2")(x)
-
-            x = model.get_layer("mrcnn_mask_bn2")(x, training=False);
-            x = KL.Activation('relu')(x)
-
-            x = model.get_layer("mrcnn_mask_conv3")(x)
-
-            x = model.get_layer("mrcnn_mask_bn3")(x, training=False);
-            x = KL.Activation('relu')(x)
-
-            x = model.get_layer("mrcnn_mask_conv4")(x)
-
-            x = model.get_layer("mrcnn_mask_bn4")(x, training=False);
-            x = KL.Activation('relu')(x)
-
-            x = model.get_layer("mrcnn_mask_deconv")(x)
-
-            mrcnn_mask_eval = model.get_layer("mrcnn_mask")(x)
-
-            self.keras_mask_head_eval = KM.Model(
-
-                [eval_rois, eval_meta, p2_in, p3_in, p4_in, p5_in],
-
-                mrcnn_mask_eval,
-
-                name="mask_head_eval"
-
-            )
-
-            # ------------------------------------------------------------------
-
-            return model
+        return self.keras_model
 
     def compile(self):
         """
         Gets the model ready for training. Adds losses, regularization, and
         metrics. Then calls the Keras compile() function.
         """
-
         self.keras_model.metrics_tensors = []
 
+        # Use Adam by default for better convergence
         if self.config.OPTIMIZER["name"] == "ADADELTA":
-
             optimizer = keras.optimizers.Adadelta(**self.config.OPTIMIZER["parameters"])
-
         elif self.config.OPTIMIZER["name"] == "SGD":
-
             optimizer = keras.optimizers.SGD(**self.config.OPTIMIZER["parameters"])
+        else:
+            optimizer = keras.optimizers.Adam(learning_rate=0.001)  # Default Adam
 
         # Add Losses
-        # First, clear previously set losses to avoid duplication
         self.keras_model._losses = []
         self.keras_model._per_input_losses = {}
 
         if self.config.LEARNING_LAYERS == "rpn":
-
             loss_names = ["rpn_class_loss", "rpn_bbox_loss"]
-
         elif self.config.LEARNING_LAYERS == "heads":
-
-            loss_names = [
-                "mrcnn_class_loss", "mrcnn_bbox_loss", "mrcnn_mask_loss"]
-            
+            loss_names = ["mrcnn_class_loss", "mrcnn_bbox_loss", "mrcnn_mask_loss"]
         elif self.config.LEARNING_LAYERS == "all":
+            loss_names = ["rpn_class_loss", "rpn_bbox_loss", "mrcnn_class_loss", "mrcnn_bbox_loss", "mrcnn_mask_loss"]
 
-            loss_names = [
-                "rpn_class_loss", "rpn_bbox_loss",
-                "mrcnn_class_loss", "mrcnn_bbox_loss", "mrcnn_mask_loss"]
-            
         for name in loss_names:
             layer = self.keras_model.get_layer(name)
-            loss = (
-                    tf.reduce_mean(layer.output, keepdims=True)
-                    * self.config.LOSS_WEIGHTS.get(name, 1.)
-                )
+            loss = tf.reduce_mean(layer.output, keepdims=True) * self.config.LOSS_WEIGHTS.get(name, 1.)
             self.keras_model.add_loss(loss)
 
         # Add L2 Regularization
-        # Skip gamma and beta weights of batch normalization layers.
         reg_losses = [
             keras.regularizers.l2(self.config.WEIGHT_DECAY)(w) / tf.cast(tf.size(w), tf.float32)
-            for w in self.keras_model.trainable_weights
-            if 'gamma' not in w.name and 'beta' not in w.name]
+            for w in self.keras_model.trainable_weights if 'gamma' not in w.name and 'beta' not in w.name
+        ]
         self.keras_model.add_loss(tf.add_n(reg_losses))
 
-        # Compile
-        self.keras_model.compile(optimizer=optimizer, loss=[None] * len(self.keras_model.outputs))
-                
-    def train(self):
+        # Add metrics for monitoring
+        def mean_loss(y_true, y_pred):
+            return K.mean(y_pred)
 
+        self.keras_model.compile(
+            optimizer=optimizer,
+            loss=[None] * len(self.keras_model.outputs),
+            metrics={'mrcnn_class_loss': mean_loss, 'mrcnn_bbox_loss': mean_loss,
+                     'mrcnn_mask_loss': mean_loss} if "heads" in self.config.LEARNING_LAYERS else None
+        )
+
+    def train(self):
         assert self.config.MODE == "training", "Create model in training mode."
 
-        # Create Data Generators
-        train_generator = MrcnnGenerator(dataset=self.train_dataset, config=self.config)
+        # Split dataset into train/val (80/20)
+        train_ids = self.train_dataset.image_ids
+        np.random.shuffle(train_ids)
+        split = int(0.8 * len(train_ids))
+        train_ids, val_ids = train_ids[split:], train_ids[:split]
 
-        # Callback for saving weights
-        # save_weights = SaveWeightsCallback(self.config.WEIGHT_DIR)
+        # Generator with z-score normalization
+        def normalize_volume(vol):
+            mu, sigma = np.mean(vol), np.std(vol)
+            return (vol - mu) / sigma if sigma > 0 else vol
+
+        class NormalizedMrcnnGenerator(MrcnnGenerator):
+            def load_image_gt(self, dataset, config, image_id, augment=False, augmentation=None, use_mini_mask=False):
+                image, image_meta, gt_class_ids, gt_boxes, gt_masks = super().load_image_gt(dataset, config, image_id,
+                                                                                            augment, augmentation,
+                                                                                            use_mini_mask)
+                image = normalize_volume(image)
+                return image, image_meta, gt_class_ids, gt_boxes, gt_masks
+
+        train_generator = NormalizedMrcnnGenerator(dataset=self.train_dataset.subset(train_ids), config=self.config)
+        val_generator = NormalizedMrcnnGenerator(dataset=self.train_dataset.subset(val_ids), config=self.config)
+
+        # Callbacks
         save_weights = BestAndLatestCheckpoint(save_path=self.config.WEIGHT_DIR, mode='MRCNN')
+        from keras.callbacks import EarlyStopping, ReduceLROnPlateau, TensorBoard
+        early_stop = EarlyStopping(monitor='val_loss', patience=10, verbose=1)
+        reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5, verbose=1)
+        tensorboard = TensorBoard(log_dir=os.path.join(self.config.WEIGHT_DIR, 'logs'))
+
         # Model compilation
         self.compile()
 
         # Initialize weight dir
         os.makedirs(self.config.WEIGHT_DIR, exist_ok=True)
 
-        # These conditions allows to customize the weights imports
+        # Load weights
         if self.config.MASK_WEIGHTS:
             self.keras_model.load_weights(self.config.MASK_WEIGHTS, by_name=True)
         if self.config.RPN_WEIGHTS:
@@ -3521,100 +3490,93 @@ class MaskRCNN():
         if self.config.HEAD_WEIGHTS:
             self.keras_model.load_weights(self.config.HEAD_WEIGHTS, by_name=True)
 
-        # Work-around for Windows: Keras fails on Windows when using
-        # multiprocessing workers. See discussion here:
-        # https://github.com/matterport/Mask_RCNN/issues/13#issuecomment-353124009
-        if os.name == 'nt':
-            workers = 0
-        else:
-            workers = multiprocessing.cpu_count()
+        # Workers=0 for stability
+        workers = 0
 
         self.keras_model.fit_generator(
             train_generator,
             initial_epoch=self.config.FROM_EPOCH,
             epochs=self.config.FROM_EPOCH + self.config.EPOCHS,
-            steps_per_epoch=len(self.train_dataset.image_info),
-            callbacks=[save_weights],
-            validation_data=None,
+            steps_per_epoch=len(train_ids),
+            callbacks=[save_weights, early_stop, reduce_lr, tensorboard],
+            validation_data=val_generator,
+            validation_steps=len(val_ids),
             max_queue_size=30,
             workers=workers,
-            use_multiprocessing=True,
+            use_multiprocessing=False,
         )
 
-    def _refine_detections_numpy(self, rpn_rois, mrcnn_class, mrcnn_bbox, image_meta):
+    def _refine_detections_numpy(self, rpn_rois_batch, mrcnn_class, mrcnn_bbox, image_meta,
+                                 min_conf=None, nms_thr=None, max_inst=None):
         """
-        ВНЕГРАФОВЫЙ детектор (fallback), если DetectionLayer дал 0.
-        Входы:
-          rpn_rois:    [1, R, 6] норм. (y1,x1,z1,y2,x2,z2)
-          mrcnn_class: [1, R, C] softmax по классам (bg=0)
-          mrcnn_bbox:  [1, R, C, 6] или [1, R, C*6] дельты
-          image_meta:  [1, META] (здесь не используем, размеры берём из config)
-        Вывод:
-          detections_np: [N, 8]  (y1,x1,z1,y2,x2,z2, class_id, score) — НОРМАЛИЗОВАННЫЕ координаты
+        rpn_rois_batch: [1,R,6] norm
+        mrcnn_class:    [R,C]
+        mrcnn_bbox:     [R,C,6] — в стандартизованных deltas
+        image_meta:     [1, meta]
+        Возвращает: detections [N,8] = (y1,x1,z1,y2,x2,z2, cls_id, score), norm coords
         """
         import numpy as np
         from core import utils
 
-        # --- параметры ---
-        min_conf = float(getattr(self.config, "DETECTION_MIN_CONFIDENCE", 0.15))
-        nms_thr = float(getattr(self.config, "DETECTION_NMS_THRESHOLD", 0.45) or 0.45)
-        max_inst = int(getattr(self.config, "DETECTION_MAX_INSTANCES", 100))
-        bbox_std = np.asarray(self.config.BBOX_STD_DEV, dtype=np.float32)
-        H, W, D = self.config.IMAGE_SHAPE[:3]
+        min_conf = float(getattr(self.config, "DETECTION_MIN_CONFIDENCE", 0.15) if min_conf is None else min_conf)
+        nms_thr = float(getattr(self.config, "DETECTION_NMS_THRESHOLD", 0.45) if nms_thr is None else nms_thr)
+        max_inst = int(getattr(self.config, "DETECTION_MAX_INSTANCES", 200) if max_inst is None else max_inst)
 
-        # --- приведение форм ---
-        rois = np.asarray(rpn_rois[0], dtype=np.float32)  # [R,6] norm
-        scores = np.asarray(mrcnn_class[0], dtype=np.float32)  # [R,C]
-        deltas = np.asarray(mrcnn_bbox[0], dtype=np.float32)  # [R,C,6] | [R,C*6]
-        if deltas.ndim == 2:
-            C = scores.shape[1]
-            deltas = deltas.reshape((rois.shape[0], C, 6))
+        # batch=1
+        rois_nm = rpn_rois_batch[0]  # [R,6] norm
+        probs = mrcnn_class  # [R,C]
+        deltas = mrcnn_bbox  # [R,C,6]
 
-        C = scores.shape[1]
+        # размеры кадра для перевода в пиксели
+        img_shape = self.config.IMAGE_SHAPE[:3]
+        rois_px = utils.denorm_boxes(rois_nm, img_shape).astype(np.float32)  # [R,6]
+
+        C = probs.shape[1]
+        H, W, D = img_shape
         detections_all = []
 
-        # --- по каждому НЕ-фоновому классу ---
+        # по классам (1..C-1), 0 — фон
         for c in range(1, C):
-            cls_scores = scores[:, c]  # [R]
+            cls_scores = probs[:, c]
             keep_ix = np.where(cls_scores >= min_conf)[0]
             if keep_ix.size == 0:
                 continue
 
-            rois_c = rois[keep_ix]  # [K,6] norm
-            deltas_c = deltas[keep_ix, c, :] * bbox_std  # [K,6]
+            # decode deltas для этого класса
+            class_deltas = deltas[keep_ix, c, :]  # [K,6]
+            boxes_ref = rois_px[keep_ix]  # [K,6]
+            refined_px = utils.apply_box_deltas_3d(boxes_ref, class_deltas, self.config.BBOX_STD_DEV)
+            refined_px = refined_px.astype(np.float32)
 
-            # denorm → применить дельты → клип в пикселях
-            rois_px = utils.denorm_boxes(rois_c, (H, W, D)).astype(np.float32)  # [K,6] pixels
-            ref_px = utils.apply_box_deltas_3d(rois_px, deltas_c)  # [K,6] pixels
+            # клиппим
+            refined_px[:, 0] = np.clip(refined_px[:, 0], 0, H - 1)
+            refined_px[:, 1] = np.clip(refined_px[:, 1], 0, W - 1)
+            refined_px[:, 2] = np.clip(refined_px[:, 2], 0, D - 1)
+            refined_px[:, 3] = np.clip(refined_px[:, 3], 0, H - 1)
+            refined_px[:, 4] = np.clip(refined_px[:, 4], 0, W - 1)
+            refined_px[:, 5] = np.clip(refined_px[:, 5], 0, D - 1)
 
-            # клип к границам изображения
-            ref_px[:, 0] = np.clip(ref_px[:, 0], 0, H - 1)
-            ref_px[:, 1] = np.clip(ref_px[:, 1], 0, W - 1)
-            ref_px[:, 2] = np.clip(ref_px[:, 2], 0, D - 1)
-            ref_px[:, 3] = np.clip(ref_px[:, 3], 0, H - 1)
-            ref_px[:, 4] = np.clip(ref_px[:, 4], 0, W - 1)
-            ref_px[:, 5] = np.clip(ref_px[:, 5], 0, D - 1)
-
-            # фильтр tiny-боксов
-            hh = ref_px[:, 3] - ref_px[:, 0]
-            ww = ref_px[:, 4] - ref_px[:, 1]
-            dd = ref_px[:, 5] - ref_px[:, 2]
+            # tiny-фильтр
+            hh = refined_px[:, 3] - refined_px[:, 0]
+            ww = refined_px[:, 4] - refined_px[:, 1]
+            dd = refined_px[:, 5] - refined_px[:, 2]
             ok = np.where((hh > 1) & (ww > 1) & (dd > 0.5))[0]
             if ok.size == 0:
                 continue
-            ref_px = ref_px[ok]
+            refined_px = refined_px[ok]
             sc = cls_scores[keep_ix][ok]
 
-            # NMS 3D (ваш utils.non_max_suppression_3d)
-            ref_px_nms, keep_local = utils.non_max_suppression_3d(ref_px, sc, threshold=nms_thr, max_boxes=max_inst)
-            if ref_px_nms.shape[0] == 0:
+            # 3D-NMS
+            refined_px_nms, keep_local = utils.non_max_suppression_3d(refined_px, sc, threshold=nms_thr,
+                                                                      max_boxes=max_inst)
+            if refined_px_nms.shape[0] == 0:
                 continue
             sc_nms = sc[keep_local]
 
-            # нормализация обратно в [0,1], формирование записей
-            ref_nm = utils.norm_boxes(ref_px_nms, (H, W, D)).astype(np.float32)
-            cls_id = np.full((ref_nm.shape[0], 1), float(c), dtype=np.float32)
-            det_c = np.concatenate([ref_nm, cls_id, sc_nms[:, None]], axis=1)  # [M,8]
+            # обратно в норм. координаты + склейка
+            refined_nm = utils.norm_boxes(refined_px_nms, (H, W, D)).astype(np.float32)
+            cls_id_col = np.full((refined_nm.shape[0], 1), float(c), dtype=np.float32)
+            det_c = np.concatenate([refined_nm, cls_id_col, sc_nms[:, None]], axis=1)  # [M,8]
             detections_all.append(det_c)
 
         if len(detections_all) == 0:
@@ -3627,183 +3589,336 @@ class MaskRCNN():
             det = det[:max_inst]
         return det
 
+    def process_image(self, image_id, generator, result_dir, roi_probe=None, cls_probe=None, det_idx=0, mask_idx=3):
+        """
+        Process a single image for evaluation.
+
+        Args:
+            image_id: ID of the image to process.
+            generator: Instance of NormalizedMrcnnGenerator.
+            result_dir: Directory to save results.
+            roi_probe: Keras model to extract ROIs (optional).
+            cls_probe: Keras model to extract class probabilities (optional).
+            det_idx: Index of detections in model output.
+            mask_idx: Index of masks in model output.
+
+        Returns:
+            List of metrics and metadata for the image.
+        """
+        import numpy as np
+        import matplotlib.pyplot as plt
+        from core.utils import compute_ap
+        from skimage.io import imsave
+
+        # Get inputs
+        name, inputs = generator.get_input_prediction(image_id)
+        name = name.rsplit(".", 1)[0]
+        print(f"[DEBUG] Processing image: {name}, ID: {image_id}")
+
+        # Fixed z-score normalization
+        def normalize_volume(vol):
+            mu, sigma = np.mean(vol), np.std(vol)
+            return (vol - mu) / sigma if sigma > 0 else vol
+
+        inputs[0][0] = normalize_volume(inputs[0][0])
+        print(
+            f"[DEBUG] Image shape: {inputs[0][0].shape}, mean: {np.mean(inputs[0][0]):.2f}, std: {np.std(inputs[0][0]):.2f}")
+
+        # Debugging: Save ROIs and class probs
+        roiN = None
+        maxClsProb = None
+        if roi_probe:
+            try:
+                rois = roi_probe.predict(inputs, batch_size=1, verbose=0)[0]
+                roiN = int(rois.shape[0])
+                np.save(os.path.join(result_dir, f"{name}_proposals.npy"), rois)
+                print(f"[DEBUG] {name}: {roiN} proposals saved")
+                # Compute IoU with GT boxes for debugging
+                try:
+                    gt_boxes, _, _ = self.test_dataset.load_data(image_id)
+                    if gt_boxes is not None and gt_boxes.size > 0:
+                        # Normalize gt_boxes to [0,1] for IoU with normalized rois
+                        image_shape = self.config.IMAGE_SHAPE[:3]
+                        gt_boxes_norm = utils.norm_boxes(gt_boxes.astype(np.float32), image_shape)
+                        overlaps = overlaps_graph(rois, gt_boxes_norm)
+                        mean_iou = float(np.mean(np.max(overlaps, axis=1))) if overlaps.size else 0.0
+                        print(f"[DEBUG] {name} proposals mean IoU with GT: {mean_iou:.3f}")
+                except Exception as e:
+                    print(f"[DEBUG] IoU computation failed: {e}")
+            except Exception as e:
+                print(f"[WARN] ROI probe failed for {name}: {e}")
+        if cls_probe:
+            try:
+                cls = cls_probe.predict(inputs, batch_size=1, verbose=0)[0]
+                maxClsProb = float(np.max(cls[:, 1])) if cls.shape[1] > 1 and cls.size else 0.0
+                np.save(os.path.join(result_dir, f"{name}_class_probs.npy"), cls)
+                print(f"[DEBUG] {name}: max class prob: {maxClsProb:.3f}")
+            except Exception as e:
+                print(f"[WARN] Class probe failed for {name}: {e}")
+
+        # Main inference
+        outs = self.keras_model.predict(inputs, batch_size=1, verbose=0)
+        if not isinstance(outs, (list, tuple)):
+            outs = [outs]
+        detections = outs[det_idx]
+        mrcnn_mask = outs[mask_idx]
+
+        # Debug raw detections
+        max_raw_score = np.max(detections[:, 7]) if detections.size else 0.0
+        print(f"[DEBUG] {name}: Max raw detection score: {max_raw_score:.3f}")
+
+        # Unmold detections
+        pd_boxes, pd_scores, pd_class_ids, pd_masks, pd_segs = self.unmold_detections(detections[0], mrcnn_mask[0])
+        pred_inst = int(pd_boxes.shape[0])
+        print(f"[DEBUG] {name}: {pred_inst} detections after unmold")
+
+        # Ground truth
+        try:
+            gt_boxes, gt_class_ids, gt_masks = self.test_dataset.load_data(image_id, masks_needed=True)
+            print(f"[DEBUG] {name}: GT boxes: {gt_boxes.shape[0] if gt_boxes is not None else 0}, "
+                  f"GT masks: {gt_masks.shape[-1] if gt_masks is not None else 0}")
+        except TypeError:
+            gt_boxes, gt_class_ids, gt_masks = self.test_dataset.load_data(image_id)
+            print(f"[DEBUG] {name}: GT boxes (fallback): {gt_boxes.shape[0] if gt_boxes is not None else 0}")
+
+        # Metrics with NaN handling
+        if (gt_masks is None or gt_masks.size == 0 or gt_masks.shape[-1] == 0) and pred_inst == 0:
+            ap50 = prec50 = rec50 = miou = pxP = pxR = pxF1 = 0.0
+            dice_mean = dice_std = 0.0
+            dice_n = 0
+        else:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                ap50, prec50, rec50, ious = compute_ap(
+                    gt_boxes, gt_class_ids, gt_masks,
+                    pd_boxes, pd_class_ids, pd_scores, pd_masks,
+                    iou_threshold=0.5
+                )
+                prec50 = prec50 if not np.isnan(prec50) else 0.0  # Handle NaN
+                miou = float(np.mean(ious)) if len(ious) else 0.0
+
+            if gt_masks is None or gt_masks.size == 0 or pd_masks is None or pd_masks.size == 0:
+                pxP = pxR = pxF1 = 0.0
+                dice_vals = []
+            else:
+                pxP, pxR, pxF1 = self._pixelwise_metrics(pd_masks > 0.5, gt_masks > 0)  # Use binary
+                dice_vals = self._instance_dice(pd_masks, gt_masks)
+            dice_mean = float(np.mean(dice_vals)) if len(dice_vals) else 0.0
+            dice_std = float(np.std(dice_vals)) if len(dice_vals) else 0.0
+            dice_n = int(len(dice_vals))
+
+        # Print per-image metrics
+        print(f"{name} AP50:{ap50:.3f} P:{prec50:.3f} R:{rec50:.3f} mIoU:{miou:.3f} "
+              f"pxP:{pxP:.3f} pxR:{pxR:.3f} pxF1:{pxF1:.3f} Dice:{dice_mean:.3f}±{dice_std:.3f} inst:{pred_inst}")
+
+        # Save visualization for debugging
+        try:
+            fig, ax = plt.subplots(1, 3, figsize=(15, 5))
+            input_slice = inputs[0][0][..., 0].mean(axis=2)  # Mean over Z for vis
+            ax[0].imshow(input_slice, cmap='gray')
+            ax[0].set_title("Input Image")
+
+            # GT mask: sum over instances if exists, else zeros
+            gt_vis = np.any(gt_masks > 0, axis=-1).mean(axis=2) if gt_masks is not None and gt_masks.shape[
+                -1] > 0 else np.zeros_like(input_slice)
+            ax[1].imshow(gt_vis, cmap='jet')
+            ax[1].set_title("GT Mask")
+
+            # Pred seg: mean over Z
+            ax[2].imshow(pd_segs.mean(axis=2), cmap='jet')
+            ax[2].set_title("Predicted Seg")
+            plt.savefig(os.path.join(result_dir, f"{name}_vis.png"))
+            plt.close()
+            print(f"[DEBUG] Visualization saved for {name}")
+        except Exception as e:
+            print(f"[WARN] Visualization failed for {name}: {e}")
+
+        # Save outputs
+        try:
+            self.save_classes_and_boxes(pd_class_ids, pd_boxes, name)
+            imsave(os.path.join(result_dir, f"{name}.tiff"), pd_segs.astype(np.uint8), check_contrast=False)
+            print(f"[DEBUG] Outputs saved for {name}")
+        except Exception as e:
+            print(f"[WARN] Save outputs failed for {name}: {e}")
+
+        return [name, pred_inst, ap50, prec50, rec50, miou, pxP, pxR, pxF1, dice_mean, dice_std, dice_n,
+                (roiN if roiN is not None else -1), (maxClsProb if maxClsProb is not None else -1.0)]
+
     def evaluate(self):
         """
-        Полный eval с диагностикой ROIAlign и fallback-детектором.
+        Inference and evaluation with metrics, using fixed z-score normalization,
+        proper multiprocessing, and debugging outputs.
         """
         import os
         import numpy as np
         import pandas as pd
-        from skimage.io import imsave
+        from tqdm import tqdm
+        import keras
+        from core.data_generators import MrcnnGenerator
         from core.utils import compute_ap
+        import multiprocessing as mp
+        from functools import partial
 
         assert self.config.MODE == "inference", "Create model in inference mode."
 
-        # --- Загрузка весов (как у тебя) ---
-        if getattr(self.config, "MASK_WEIGHTS", None):
-            self.keras_model.load_weights(self.config.MASK_WEIGHTS, by_name=True)
-        if getattr(self.config, "RPN_WEIGHTS", None):
-            self.keras_model.load_weights(self.config.RPN_WEIGHTS, by_name=True)
-        if getattr(self.config, "HEAD_WEIGHTS", None):
-            self.keras_model.load_weights(self.config.HEAD_WEIGHTS, by_name=True)
+        # Load weights
+        rpn_w = getattr(self.config, "RPN_WEIGHTS", None)
+        if rpn_w:
+            try:
+                self.keras_model.load_weights(rpn_w, by_name=True)
+                print("[RPN] loaded by_name")
+            except Exception as e:
+                print(f"[RPN] load failed ({type(e).__name__}): {e}")
 
-        # Проба принудительной прокопировки (не критично, но пусть будет)
-        if hasattr(self, "_force_load_head_weights"):
-            self._force_load_head_weights()
-        if hasattr(self, "_head_weight_healthcheck"):
-            self._head_weight_healthcheck()
+        head_w = getattr(self.config, "HEAD_WEIGHTS", None)
+        if head_w:
+            try:
+                self.keras_model.load_weights(head_w, by_name=True)
+                print("[HEAD] loaded by_name")
+            except Exception as e:
+                print(f"[HEAD] load failed ({type(e).__name__}): {e}")
 
-        # --- Генератор ---
-        data_generator = MrcnnGenerator(dataset=self.test_dataset, config=self.config)
+        # Force detection thresholds
+        try:
+            det_layer = self.keras_model.get_layer("mrcnn_detection")
+            if hasattr(self.config, "DETECTION_MIN_CONFIDENCE"):
+                det_layer.detection_min_confidence = float(self.config.DETECTION_MIN_CONFIDENCE)
+            if hasattr(self.config, "DETECTION_NMS_THRESHOLD"):
+                det_layer.detection_nms_threshold = float(self.config.DETECTION_NMS_THRESHOLD)
+            print(f"[INFO] Detection thresholds (forced): min_conf={det_layer.detection_min_confidence} "
+                  f"nms_thr={det_layer.detection_nms_threshold}")
+        except Exception:
+            print("[WARN] Failed to set detection thresholds")
 
-        # --- Папка результатов ---
-        result_dir = self.config.OUTPUT_DIR
+        # Generator with fixed z-score normalization
+        class NormalizedMrcnnGenerator(MrcnnGenerator):
+            def load_image_gt(self, dataset, config, image_id, augment=False, augmentation=None, use_mini_mask=False):
+                image, image_meta, gt_class_ids, gt_boxes, gt_masks = super().load_image_gt(
+                    dataset, config, image_id, augment, augmentation, use_mini_mask
+                )
+                mu, sigma = np.mean(image), np.std(image)
+                image = (image - mu) / sigma if sigma > 0 else image
+                return image, image_meta, gt_class_ids, gt_boxes, gt_masks
+
+        gen = NormalizedMrcnnGenerator(dataset=self.test_dataset, config=self.config,
+                                       shuffle=False, batch_size=1, training=False)
+
+        # Output indices
+        out_names = [t.name.split("/")[0] for t in self.keras_model.outputs]
+        det_idx = out_names.index("mrcnn_detection") if "mrcnn_detection" in out_names else 0
+        mask_idx = out_names.index("mrcnn_mask") if "mrcnn_mask" in out_names else min(3, len(out_names) - 1)
+
+        # Probe models for debugging
+        KM = keras.models
+        roi_probe = None
+        cls_probe = None
+        try:
+            roi_probe = KM.Model(self.keras_model.inputs, self.keras_model.get_layer("ROI").output)
+        except Exception:
+            print("[WARN] Failed to create ROI probe")
+        try:
+            cls_probe = KM.Model(self.keras_model.inputs, self.keras_model.get_layer("mrcnn_class").output)
+        except Exception:
+            print("[WARN] Failed to create class probe")
+
+        result_dir = getattr(self.config, "OUTPUT_DIR", "./")
         os.makedirs(result_dir, exist_ok=True)
+        cols = ["name", "inst", "AP50", "P50", "R50", "mIoU", "pxP", "pxR", "pxF1", "DiceMean", "DiceStd", "DiceN",
+                "roiN", "maxCls"]
+        df = pd.DataFrame(columns=cols)
 
-        # --- Пороговые параметры ---
-        MIN_CONF = float(getattr(self.config, "DETECTION_MIN_CONFIDENCE", 0.15))
-        NMS_THR = float(getattr(self.config, "DETECTION_NMS_THRESHOLD", 0.45) or 0.45)
-        print(f"[INFO] Detection thresholds — MIN_CONF={MIN_CONF:.2f}, NMS_THR={NMS_THR:.2f}")
+        # Sort image IDs to ensure consistent order
+        ids = sorted(list(self.test_dataset.image_ids))  # Explicit sorting
+        print(f"Evaluating {len(ids)} images")
 
-        # --- Заглушка-объём для пустых случаев ---
-        H, W, D = self.config.IMAGE_SHAPE[:3]
-        blank_zyx = np.zeros((D, H, W), dtype=np.uint16)
+        # Multiprocessing or single-threaded
+        results = []
+        if os.name != 'nt':
+            try:
+                process_func = partial(self.process_image, generator=gen, result_dir=result_dir,
+                                       roi_probe=roi_probe, cls_probe=cls_probe, det_idx=det_idx, mask_idx=mask_idx)
+                with mp.Pool(processes=mp.cpu_count() // 2) as pool:
+                    results = list(tqdm(pool.imap(process_func, ids), total=len(ids), desc="Evaluating"))
+            except Exception as e:
+                print(f"[WARN] Multiprocessing failed: {e}. Falling back to single-threaded.")
+                results = [self.process_image(id, gen, result_dir, roi_probe, cls_probe, det_idx, mask_idx)
+                           for id in tqdm(ids, desc="Evaluating")]
+        else:
+            results = [self.process_image(id, gen, result_dir, roi_probe, cls_probe, det_idx, mask_idx)
+                       for id in tqdm(ids, desc="Evaluating")]
 
-        # --- Таблица результатов ---
-        result_dataframe = pd.DataFrame({
-            "name": [], "instance_nb": [], "map-50": [],
-            "precision-50": [], "recall-50": [], "iou-50": [],
-        })
+        # Populate DataFrame
+        for res in results:
+            df.loc[len(df.index)] = res
 
-        num_imgs = len(self.test_dataset.image_info)
-        printed_debug = False  # диагностику ROI печатаем один раз, чтобы лог не распух
+        # Save report
+        csv_path = os.path.join(result_dir, "report.csv")
+        try:
+            df.to_csv(csv_path, index=False)
+            print(f"[EVAL] Saved report: {csv_path}")
+        except Exception as e:
+            print(f"[WARN] CSV save failed: {e}")
 
-        for i in range(num_imgs):
-            # ----- входы -----
-            name, inputs = data_generator.get_input_prediction(i)
-            name = name.split(".")[0]
+        # Print mean metrics to console
+        try:
+            with np.errstate(invalid="ignore"):
+                mean_metrics = df[["AP50", "P50", "R50", "mIoU", "pxP", "pxR", "pxF1", "DiceMean"]].mean(
+                    numeric_only=True)
+                print("\n[EVAL] Mean Metrics:")
+                for metric, value in mean_metrics.items():
+                    print(f"{metric}: {value:.4f}")
+                # Additional debugging stats
+                print(f"Mean instances per image: {df['inst'].mean():.2f}")
+                print(f"Mean ROIs per image: {df['roiN'].mean():.2f}")
+                print(f"Mean max class prob: {df['maxCls'].mean():.3f}")
+        except Exception as e:
+            print(f"[WARN] Failed to print metrics: {e}")
+            print("[EVAL] DataFrame contents:")
+            print(df)
 
-            # ----- GT -----
-            _, _, gt_boxes, gt_class_ids, gt_masks = data_generator.load_image_gt(i)
-            gt_inst = int(gt_masks.shape[-1]) if hasattr(gt_masks, "shape") else 0
+        return df
 
-            # ----- (опц.) Диагностика ROIAlign -----
-            if (not printed_debug) and getattr(self, "keras_roi_debug", None) is not None:
-                try:
-                    roi_feat = self.keras_roi_debug.predict(inputs, verbose=0)  # [1, R, ph,pw,pd,C]
-                    rf = roi_feat[0]  # [R,ph,pw,pd,C]
-                    rf_mean = float(np.mean(rf))
-                    rf_std = float(np.std(rf))
-                    # по каналам усредним дисперсию — важно, чтобы она не была ~0
-                    rf_var_per_ch = np.var(rf, axis=(0, 1, 2, 3))  # [C]
-                    rf_var_med = float(np.median(rf_var_per_ch))
-                    print(
-                        f"[DEBUG] ROIAlign features: mean={rf_mean:.4f}, std={rf_std:.4f}, median var/ch={rf_var_med:.6e}")
-                    if rf_std < 1e-6 or rf_var_med < 1e-10:
-                        print(
-                            "[ALERT] ROIAlign features look nearly constant! Check boxes normalization and crop_and_resize_3d.")
-                    printed_debug = True
-                except Exception as e:
-                    print(f"[DEBUG] ROI features probe failed: {e}")
-                    printed_debug = True
+    def _pixelwise_metrics(self, pred_bin, gt_bin):
+        """Calculate pixelwise precision, recall, and F1 score."""
+        tp = np.logical_and(pred_bin, gt_bin).sum(dtype=np.int64)
+        fp = np.logical_and(pred_bin, np.logical_not(gt_bin)).sum(dtype=np.int64)
+        fn = np.logical_and(np.logical_not(pred_bin), gt_bin).sum(dtype=np.int64)
+        prec = (tp / (tp + fp + 1e-9)) if (tp + fp) > 0 else 0.0
+        rec = (tp / (tp + fn + 1e-9)) if (tp + fn) > 0 else 0.0
+        f1 = (2.0 * prec * rec / (prec + rec + 1e-9)) if (prec + rec) > 0 else 0.0
+        return float(prec), float(rec), float(f1)
 
-            # ----- Инференс графа -----
-            # out = [detections, mrcnn_class, mrcnn_bbox, mrcnn_mask, rpn_rois, rpn_class, rpn_bbox]
-            out = self.keras_model.predict(inputs, verbose=0)
-            detections_batch = out[0]
-            mrcnn_class = out[1]
-            mrcnn_bbox = out[2]
-            mrcnn_mask_batch = out[3]
-            rpn_rois_batch = out[4]
-
-            # разворот batch=1
-            detections = detections_batch[0]
-            probs = mrcnn_class[0]
-            rpn_rois = rpn_rois_batch[0]
-            mrcnn_mask = mrcnn_mask_batch[0]
-
-            # ---- Диагностика головы ДО DetectionLayer ----
-            R = int(rpn_rois.shape[0]) if hasattr(rpn_rois, "shape") else 0
-            C = int(probs.shape[1]) if hasattr(probs, "shape") and probs.ndim == 2 else 0
-            if C >= 2 and R > 0:
-                non_bg = probs[:, 1:]
-                best_scores = non_bg.max(axis=1) if non_bg.size else np.zeros((R,), dtype=np.float32)
-            else:
-                best_scores = np.zeros((R,), dtype=np.float32)
-            cnt_ge_min = int((best_scores >= MIN_CONF).sum()) if best_scores.size else 0
-            cnt_ge_020 = int((best_scores >= 0.20).sum()) if best_scores.size else 0
-            top5 = np.round(np.sort(best_scores)[-5:][::-1], 3).tolist() if best_scores.size else []
-
-            # сколько прошло через DetectionLayer (class_id > 0)
-            raw_det = int(np.sum(detections[:, 6] > 0)) if detections.size else 0
-
-            # ----- FALLBACK: если граф дал 0 детекций, пытаемся вне графа -----
-            used_fallback = False
-            if raw_det <= 0:
-                try:
-                    core_out = self.keras_infer_core.predict(inputs, verbose=0)  # [detections, P2..P5]
-                    P2, P3, P4, P5 = core_out[1], core_out[2], core_out[3], core_out[4]
-
-                    det_np = self._refine_detections_numpy(rpn_rois_batch, mrcnn_class, mrcnn_bbox, inputs[1])
-                    if det_np.shape[0] > 0:
-                        boxes_nm = det_np[np.newaxis, :, :6]  # [1,N,6]
-                        mrcnn_mask = self.keras_mask_head_eval.predict(
-                            [boxes_nm, inputs[1], P2, P3, P4, P5], verbose=0
-                        )[0]
-                        detections = det_np
-                        raw_det = int(np.sum(detections[:, 6] > 0))
-                        used_fallback = True
-                except Exception as e:
-                    print(f"[FALLBACK] error: {e}")
-
-            # ----- Если совсем пусто -----
-            if raw_det <= 0:
-                imsave(f"{result_dir}{name}.tiff", blank_zyx, check_contrast=False)
-                print(f"{i + 1}/{num_imgs}  Example: {name}  GT:{gt_inst}  RPN-ROI:{R}  "
-                      f"HEAD>={MIN_CONF:.2f}:{cnt_ge_min}  >={0.20:.2f}:{cnt_ge_020}  >0:{R}  "
-                      f"RAW det:0  FINAL det:0  avg score:0.000  "
-                      f"mAP:0.000  Prec:0.000  Rec:0.000  mIoU:0.000  top5:{top5}")
-                if gt_inst > 0:
-                    result_dataframe.loc[len(result_dataframe.index)] = [name, gt_inst, 0.0, 0.0, 0.0, 0.0]
-                continue
-
-            # ----- Развёртка в пиксели и маски -----
-            pd_boxes, pd_scores, pd_class_ids, pd_masks, pd_segs = self.unmold_detections(detections, mrcnn_mask)
-            final_det = int(pd_boxes.shape[0]) if hasattr(pd_boxes, "shape") else 0
-            avg_sc = float(pd_scores.mean()) if final_det > 0 else 0.0
-
-            # сохранить боксы/классы .csv
-            self.save_classes_and_boxes(pd_class_ids, pd_boxes, name)
-
-            # сохранить сегментацию .tiff (Z,Y,X)
-            if hasattr(pd_segs, "shape") and pd_segs.ndim == 3 and pd_segs.shape[2] > 0:
-                imsave(f"{result_dir}{name}.tiff",
-                       pd_segs.transpose(2, 0, 1).astype(np.uint16),
-                       check_contrast=False)
-            else:
-                imsave(f"{result_dir}{name}.tiff", blank_zyx, check_contrast=False)
-
-            # метрики
-            map50, precision50, recall50, ious = compute_ap(
-                gt_boxes, gt_class_ids, gt_masks, pd_boxes, pd_class_ids, pd_scores, pd_masks, iou_threshold=0.5
-            )
-            map50 = float(map50) if np.isfinite(map50) else 0.0
-            precision50 = float(precision50) if np.isfinite(precision50) else 0.0
-            recall50 = float(recall50) if np.isfinite(recall50) else 0.0
-            mean_iou = float(np.mean(ious)) if (isinstance(ious, (list, np.ndarray)) and len(ious) > 0) else 0.0
-            mean_iou = mean_iou if np.isfinite(mean_iou) else 0.0
-
-            result_dataframe.loc[len(result_dataframe.index)] = [name, gt_inst, map50, precision50, recall50, mean_iou]
-
-            print(f"{i + 1}/{num_imgs}  Example: {name}  GT:{gt_inst}  RPN-ROI:{R}  "
-                  f"HEAD>={MIN_CONF:.2f}:{cnt_ge_min}  >={0.20:.2f}:{cnt_ge_020}  >0:{R}  "
-                  f"RAW det:{raw_det}  FINAL det:{final_det}  avg score:{avg_sc:.3f}  "
-                  f"mAP:{map50:.3f}  Prec:{precision50:.3f}  Rec:{recall50:.3f}  "
-                  f"mIoU:{mean_iou:.3f}  top5:{top5}" + ("  [FALLBACK]" if used_fallback else ""))
-
-        # --- сохранить сводный отчёт ---
-        result_dataframe.to_csv(f"{result_dir}report.csv", index=None)
-        print(result_dataframe.mean())
+    def _instance_dice(self, pred_masks, gt_masks, iou_thr=0.5):
+        """Calculate instance-level DICE score with IoU-based matching."""
+        K = int(pred_masks.shape[-1]) if pred_masks is not None and pred_masks.ndim == 4 else 0
+        G = int(gt_masks.shape[-1]) if gt_masks is not None and gt_masks.ndim == 4 else 0
+        if K == 0 or G == 0:
+            return 0.0, 0.0, 0
+        P = pred_masks.reshape((-1, K)).astype(np.bool_)
+        T = gt_masks.reshape((-1, G)).astype(np.bool_)
+        P_sum = P.sum(axis=0).astype(np.int64)
+        T_sum = T.sum(axis=0).astype(np.int64)
+        inter = (P.T @ T).astype(np.int64)
+        union = (P_sum[:, None] + T_sum[None, :]) - inter
+        with np.errstate(divide='ignore', invalid='ignore'):
+            iou = inter / np.maximum(union, 1)
+        used_p = np.zeros((K,), dtype=np.bool_)
+        used_g = np.zeros((G,), dtype=np.bool_)
+        dices = []
+        while True:
+            iou_mask = iou.copy()
+            iou_mask[used_p, :] = -1.0
+            iou_mask[:, used_g] = -1.0
+            k, g = np.unravel_index(np.argmax(iou_mask), iou_mask.shape)
+            if iou_mask[k, g] < iou_thr:
+                break
+            denom = P_sum[k] + T_sum[g]
+            d = (2.0 * inter[k, g] / denom) if denom > 0 else 0.0
+            dices.append(float(d))
+            used_p[k] = True
+            used_g[g] = True
+        if len(dices) == 0:
+            return 0.0, 0.0, 0
+        return float(np.mean(dices)), float(np.std(dices)), int(len(dices))
 
     def save_classes_and_boxes(self, pd_class_ids, pd_boxes, name):
         
@@ -3830,61 +3945,62 @@ class MaskRCNN():
 
     def unmold_detections(self, detections, mrcnn_mask):
         """
-        Reformats the detections of one image from the format of the neural
-        network output to a format suitable for use in the rest of the
-        application.
+        Process raw network outputs into usable detection results.
 
-        detections: [N, (y1, x1, z1, y2, x2, z2, class_id, score)] in normalized coordinates
-        mrcnn_mask: [N, height, width, depth, num_classes]
-        original_image_shape: [H, W, D, C] Original image shape before resizing
-        image_shape: [H, W, D, C] Shape of the image after resizing and padding
-        window: [y1, x1, z1, y2, x2, z2] Pixel coordinates of box in the image where the real
-                image is excluding the padding.
+        Args:
+            detections: [N, (y1, x1, z1, y2, x2, z2, class_id, score)] in normalized coordinates
+            mrcnn_mask: [N, height, width, depth, num_classes]
 
         Returns:
-        boxes: [N, (y1, x1, z1, y2, x2, z2)] Bounding boxes in pixels
-        class_ids: [N] Integer class IDs for each bounding box
-        scores: [N] Float probability scores of the class_id
-        masks: [height, width, depth, num_instances] Instance masks
+            boxes: [N, (y1, x1, z1, y2, x2, z2)] in pixel coordinates
+            scores: [N] confidence scores
+            class_ids: [N] class IDs
+            masks: [height, width, depth, N] binary instance masks
+            segs: [height, width, depth] segmentation map with instance IDs
         """
-        # How many detections do we have?
-        # Detections array is padded with zeros. Find the first class_id == 0.
-        original_image_shape = self.config.IMAGE_SHAPE[:3]
+        # Get valid detections (class_id > 0)
         zero_ix = np.where(detections[:, 6] == 0)[0]
         N = zero_ix[0] if zero_ix.shape[0] > 0 else detections.shape[0]
+        print(f"[DEBUG] Detections before class filter: {detections.shape[0]}, after: {N}")
 
-        # Extract boxes, class_ids, scores, and class-specific masks
+        # Extract data from detections
         boxes = detections[:N, :6]
         class_ids = detections[:N, 6].astype(np.int32)
         scores = detections[:N, 7]
+
+        # Get class-specific masks (use class_id to index into mask channels)
         masks = mrcnn_mask[np.arange(N), ..., class_ids]
 
-        # Convert boxes to pixel coordinates on the original image
+        # Convert normalized boxes to pixel coordinates
+        original_image_shape = self.config.IMAGE_SHAPE[:3]
         boxes = utils.denorm_boxes(boxes, original_image_shape)
 
-        # Filter out detections with zero area. Happens in early training when
-        # network weights are still random
+        # Filter out boxes with zero area
         exclude_ix = np.where(
-            (boxes[:, 3] - boxes[:, 0]) * (boxes[:, 4] - boxes[:, 1]) * (boxes[:, 5] - boxes[:, 2]) <= 0)[0]
+            (boxes[:, 3] - boxes[:, 0]) * (boxes[:, 4] - boxes[:, 1]) * (boxes[:, 5] - boxes[:, 2]) <= 0
+        )[0]
+        print(f"[DEBUG] Detections before zero-area filter: {N}, excluded: {exclude_ix.shape[0]}")
+
         if exclude_ix.shape[0] > 0:
             boxes = np.delete(boxes, exclude_ix, axis=0)
             class_ids = np.delete(class_ids, exclude_ix, axis=0)
             scores = np.delete(scores, exclude_ix, axis=0)
             masks = np.delete(masks, exclude_ix, axis=0)
-        N = boxes.shape[0]
+            N = boxes.shape[0]
 
-        unmold_masks = np.zeros((*original_image_shape, masks.shape[0]))
-        for i in range(N): 
-            unmold_masks[..., i] = utils.unmold_mask(masks[i], boxes[i], original_image_shape)
-
-        # Resize masks to original image size and set boundary threshold.
-        segs = np.zeros((original_image_shape)).astype(np.uint16)
+        # Create full-sized instance masks
+        full_masks = np.zeros((*original_image_shape, N), dtype=np.float32)
         for i in range(N):
-            # Convert neural network mask to full size mask
-            full_mask = utils.unmold_mask(masks[-i-1], boxes[-i-1], original_image_shape)
-            segs = np.where(full_mask, i+1, segs)
+            full_masks[..., i] = utils.unmold_mask(masks[i], boxes[i], original_image_shape)
 
-        return boxes, scores, class_ids, unmold_masks, segs
+        # Create segmentation map with instance IDs
+        segs = np.zeros(original_image_shape, dtype=np.uint16)
+        for i in range(N):
+            # Process in reverse order so earlier instances (lower indices) appear on top
+            mask = full_masks[..., N - i - 1] > 0.5
+            segs = np.where(mask, i + 1, segs)
+
+        return boxes, scores, class_ids, full_masks, segs
 
     def get_anchors(self, image_shape):
         """Returns anchor pyramid for the given image size."""

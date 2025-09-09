@@ -1,6 +1,7 @@
 {
     "DATA_DIR": "/NAS/mmaiurov/Datasets/rat_neurons_3d_tif_256_patches/",
     "NUM_CLASSES": 2,
+    "CLASS_NAMES": ["neuron"],
     "IMAGE_SIZE": 256,
     "IMAGE_DEPTH": 12,
     "IMAGE_CHANNEL_COUNT": 1,

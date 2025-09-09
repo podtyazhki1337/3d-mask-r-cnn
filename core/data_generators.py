@@ -166,14 +166,19 @@ def jitter_boxes_3d(boxes, count=3, scale_sigma=0.10, trans=(2, 2, 1),
 #  Data Generator
 ############################################################
 
+# core/data_generators.py
+import numpy as np
+import keras
+from core import utils
+ # уже используется ниже в других генераторах
+
 class HeadGenerator(keras.utils.Sequence):
     """
-    Генератор для обучения/оценки HEAD.
-    - TRAIN (training=True): жёсткая балансировка из всего пула ROI картинки:
-        ~HEAD_POS_FRAC позитивов в каждом батче (с повторением при нехватке fg/bg).
-        HEAD_SHUFFLE_ROIS влияет только на финальную перетасовку индексов батча.
-    - EVAL (training=False): без балансировки. Идём по картинке чанками (T), чтобы
-        равномерно покрыть все ROI между вызовами (__getitem__ выбирает chunk по _call_count).
+    Генератор для обучения/валидации HEAD.
+    Возвращает ровно то, что ожидают входы модели головы:
+      inputs : [input_rois_aligned, input_mask_aligned, input_image_meta]
+      targets: [input_target_class_ids, input_target_bbox, input_target_mask]
+    Все тензоры имеют внешнюю батч-ось (B=1).
     """
 
     def __init__(self, dataset, config, shuffle=True, training=True):
@@ -182,260 +187,129 @@ class HeadGenerator(keras.utils.Sequence):
         self.config = config
         self.shuffle = shuffle
         self.training = training
-        self.batch_size = int(getattr(self.config, "BATCH_SIZE", 1))  # держим 1 для предсказуемости VRAM
-        self._debug_calls = 0
-        self._call_count = 0  # глобальный счётчик вызовов (для циклического перебора чанков)
+        self.batch_size = int(getattr(self.config, "BATCH_SIZE", 1))
+        assert self.batch_size == 1, "HeadGenerator рассчитан на BATCH_SIZE==1 для предсказуемого VRAM"
+        self._call_count = 0
+        if self.shuffle:
+            np.random.shuffle(self.image_ids)
 
     def __len__(self):
-        # один image_id => один шаг (чанкуем/балансируем внутри __getitem__)
         return int(np.ceil(len(self.image_ids) / float(self.batch_size)))
 
-    def __getitem__(self, idx):
-        import numpy as np
+    @staticmethod
+    def _downsample_2x_mean(x):
+        """
+        x: [T, H, W, D, C], H=W=D кратны 2
+        вернёт усреднение по 2x2x2 блокам -> [T, H/2, W/2, D/2, C]
+        """
+        T, H, W, D, C = x.shape
+        assert H % 2 == 0 and W % 2 == 0 and D % 2 == 0, "Downsample expects even spatial dims"
+        x = x.reshape(T, H//2, 2, W//2, 2, D//2, 2, C)
+        return x.mean(axis=(2,4,6))
 
-        # Предполагаем batch_size == 1 (как согласовано); берём один image_id
+    def __getitem__(self, idx):
+        # берём один image_id (B=1)
         image_id = int(self.image_ids[idx])
 
-        rois_aligned, mask_aligned, image_meta, target_class_ids, target_bbox, target_mask = \
-            self.load_image_gt(image_id)
+        # dataset должен вернуть: rois_aligned [N, P,P,P, C], mask_aligned [N, M,M,M, C],
+        # target_class_ids [N], target_bbox [N, 6], target_mask [N, mH,mW,mD]
+        rois_aligned, mask_aligned, target_class_ids, target_bbox, target_mask = \
+            self.dataset.load_data(image_id)
+        H, W, D = int(self.config.IMAGE_SHAPE[0]), int(self.config.IMAGE_SHAPE[1]), int(self.config.IMAGE_SHAPE[2])
+        window = (0, 0, 0, H - 1, W - 1, D - 1)
+        active_class_ids = np.ones([self.dataset.num_classes], dtype=np.int32)
+        # image_meta для active_class_ids внутри лоссов
+        image_meta = compose_image_meta(
+            image_id=image_id,
+            original_image_shape=(H, W, D, 1),
+            image_shape=(H, W, D, 1),
+            window=window,
+            scale=1.0,
+            active_class_ids=active_class_ids
+        ).astype(np.float32)
 
-        # Приведём типы к float32 / int32 для стабильности
-        rois_aligned  = rois_aligned.astype(np.float32, copy=False)
-        mask_aligned  = mask_aligned.astype(np.float32, copy=False)
-        image_meta    = image_meta.astype(np.float32,   copy=False)
-        target_bbox   = target_bbox.astype(np.float32,  copy=False)
+        # Типы
+        rois_aligned = rois_aligned.astype(np.float32, copy=False)
+        mask_aligned = mask_aligned.astype(np.float32, copy=False)
         target_class_ids = target_class_ids.astype(np.int32, copy=False)
-        # target_mask оставим как есть; канал добавим ниже при формировании inputs
-
+        target_bbox = target_bbox.astype(np.float32, copy=False)
+        if target_mask.ndim == 4:  # [T, mH, mW, mD] -> [T, mH, mW, mD, 1]
+            target_mask = target_mask[..., np.newaxis]
+        elif target_mask.ndim != 5:
+            raise ValueError(f"[HeadGenerator] target_mask has wrong rank: {target_mask.shape} (need [T,mH,mW,mD,1])")
+        target_mask = target_mask.astype(np.float32, copy=False)
+        # Балансировка/чанк на T ROI
         T = int(getattr(self.config, "TRAIN_ROIS_PER_IMAGE", 128))
         total = int(rois_aligned.shape[0])
-
-        # Базовый порядок
         order = np.arange(total, dtype=np.int32)
         if self.training and bool(getattr(self.config, "HEAD_SHUFFLE_ROIS", True)):
             np.random.shuffle(order)
-
-        # Индексы fg/bg
         pos_idx = order[target_class_ids[order] > 0]
         neg_idx = order[target_class_ids[order] <= 0]
 
-        # Номер чанка (для EVAL-ветки)
-        num_chunks = int(np.ceil(total / float(T))) if T > 0 else 1
-        chunk_id = self._call_count % max(1, num_chunks)
-        self._call_count += 1
-
-        # Настройки балансировки
-        use_balance = self.training and bool(getattr(self.config, "HEAD_BALANCE_POS", True))
-        pos_frac = float(getattr(self.config, "HEAD_POS_FRAC", 0.25))
-        if not np.isfinite(pos_frac):
-            pos_frac = 0.25
-        pos_frac = float(min(max(pos_frac, 0.0), 1.0))
-
-        if use_balance:
-            # Жёсткая балансировка из всего пула ROI картинки
-            # Сколько позитивов хотим
-            want_pos = int(round(T * pos_frac))
-            if pos_idx.size > 0:
-                n_pos = max(1, min(want_pos, pos_idx.size)) if want_pos > 0 else 1
-                take_pos = np.random.choice(pos_idx, size=n_pos, replace=(pos_idx.size < n_pos))
+        if self.training and bool(getattr(self.config, "HEAD_BALANCE_POS", True)):
+            pos_frac = float(getattr(self.config, "HEAD_POS_FRAC", 0.33))
+            pos_cnt = int(round(T * pos_frac))
+            neg_cnt = T - pos_cnt
+            if pos_idx.size == 0:
+                # если совсем нет позитивов — берём все bg
+                batch_idx = np.random.choice(neg_idx, size=T, replace=neg_idx.size < T)
+            elif neg_idx.size == 0:
+                batch_idx = np.random.choice(pos_idx, size=T, replace=pos_idx.size < T)
             else:
-                # Если вообще нет fg — пустой набор
-                n_pos = 0
-                take_pos = np.array([], dtype=np.int32)
-
-            # Сколько негативов добираем
-            n_neg = max(T - n_pos, 0)
-            if neg_idx.size > 0:
-                take_neg = np.random.choice(neg_idx, size=n_neg, replace=(neg_idx.size < n_neg))
-            else:
-                # Экзотика: нет bg — добираем из pos с повторением (получится "всё fg")
-                base = pos_idx if pos_idx.size > 0 else order
-                take_neg = np.random.choice(base, size=n_neg, replace=True)
-
-            idxs = np.concatenate([take_pos, take_neg], axis=0)
-            # Финальная перемешка батча (если включено)
-            if bool(getattr(self.config, "HEAD_SHUFFLE_ROIS", True)):
-                np.random.shuffle(idxs)
-
-            # Паддинг до T (на всякий случай)
-            if idxs.shape[0] < T:
-                pad_src = neg_idx if neg_idx.size > 0 else (pos_idx if pos_idx.size > 0 else order)
-                pad = T - idxs.shape[0]
-                pad_ids = np.random.choice(pad_src, size=pad, replace=True)
-                idxs = np.concatenate([idxs, pad_ids], axis=0)
-
-            # Диагностический лог раз в 100 шагов
-            # if (self._debug_calls % 100) == 0:
-            #     pos_in = int(np.sum(target_class_ids[idxs] > 0))
-            #     print(f"[HEAD.train] balanced pos_in_batch = {pos_in}/{T}", flush=True)
-            # self._debug_calls += 1
-
+                pos_pick = np.random.choice(pos_idx, size=pos_cnt, replace=pos_idx.size < pos_cnt)
+                neg_pick = np.random.choice(neg_idx, size=neg_cnt, replace=neg_idx.size < neg_cnt)
+                batch_idx = np.concatenate([pos_pick, neg_pick])
+                np.random.shuffle(batch_idx)
         else:
-            # EVAL (или TRAIN без балансировки): берём последовательный чанк
-            start = chunk_id * T
-            end = min(start + T, total)
-            idxs = order[start:end]
-            # Паддинг до T (берём bg или что есть)
-            if idxs.shape[0] < T:
-                pad_src = neg_idx if neg_idx.size > 0 else (pos_idx if pos_idx.size > 0 else order)
-                pad = T - idxs.shape[0]
-                pad_ids = np.random.choice(pad_src, size=pad, replace=True)
-                idxs = np.concatenate([idxs, pad_ids], axis=0)
+            # eval: равномерно идём чанками
+            num_chunks = int(np.ceil(total / float(T))) if T > 0 else 1
+            chunk_id = self._call_count % max(1, num_chunks)
+            self._call_count += 1
+            start, end = int(chunk_id * T), min(int(chunk_id * T) + T, total)
+            batch_idx = order[start:end]
+            if len(batch_idx) < T:
+                # паддим нулями (редко) — чтобы выйти на ровно T
+                pad = T - len(batch_idx)
+                batch_idx = np.pad(batch_idx, (0, pad), mode='edge')
 
-            # Диагностический лог (можно включить)
-            # pos_in = int(np.sum(target_class_ids[idxs] > 0))
-            # print(f"[HeadGenerator] image_id={image_id} chunk {chunk_id + 1}/{num_chunks} (T={T}) "
-            #       f"pos_in_chunk={pos_in}/{T}", flush=True)
+        # Собираем батч ROI
+        rois_aligned = rois_aligned[batch_idx]
+        mask_aligned = mask_aligned[batch_idx]
+        target_class_ids = target_class_ids[batch_idx]
+        target_bbox = target_bbox[batch_idx]
+        target_mask = target_mask[batch_idx]
 
-        # Собираем батч по выбранным индексам
-        ra = rois_aligned[idxs]          # (T, 7,7,7,C)
-        ma = mask_aligned[idxs]          # (T,14,14,14,C)
-        tci = target_class_ids[idxs]     # (T,)
-        tb  = target_bbox[idxs]          # (T,6)
-        tm  = target_mask[idxs]          # (T,28,28,28) или (T,28,28,28,1)
+        # Согласуем mask_aligned с конфигом (14→7 или 7→14 не делаем, если уже совпадает)
+        Mconf = int(getattr(self.config, "MASK_POOL_SIZE", 7))
+        Mh, Mw, Md = mask_aligned.shape[1:4]
+        if (Mh, Mw, Md) != (Mconf, Mconf, Mconf):
+            if (Mh, Mw, Md) == (2*Mconf, 2*Mconf, 2*Mconf):
+                # аккуратный 2× даунсемпл по усреднению блоков
+                mask_aligned = self._downsample_2x_mean(mask_aligned)
+            else:
+                raise ValueError(f"[HeadGenerator] mask_aligned has shape {Mh}x{Mw}x{Md}, "
+                                 f"but config.MASK_POOL_SIZE={Mconf}. Приведи данные или конфиг к совпадению.")
 
-        # Лёгкая фича-аугментация при обучении (если есть реализация)
-        if self.training and hasattr(self, "_augment_head_features"):
-            ra, ma, tm = self._augment_head_features(ra, ma, tm)
-
-        # Формируем inputs с batch-осью и каналом для маски
-        if tm.ndim == 4:
-            tm = tm[..., np.newaxis]  # -> (T,28,28,28,1)
-
-        inputs = [
-            ra[np.newaxis, ...],                # (1,T,7,7,7,C)   float32
-            ma[np.newaxis, ...],                # (1,T,14,14,14,C) float32
-            image_meta[np.newaxis, ...],        # (1, meta)      float32
-            tci[np.newaxis, ...],               # (1,T)          int32
-            tb[np.newaxis, ...],                # (1,T,6)        float32
-            tm[np.newaxis, ...],                # (1,T,28,28,28,1) float32/uint8 -> выше неявно float32, если аугментация
+        # Оборачиваем ВСЁ в батч-ось
+        x = [
+            np.expand_dims(rois_aligned, 0),  # [1, T, P, P, P, C]
+            np.expand_dims(mask_aligned, 0),  # [1, T, M, M, M, C]
+            np.expand_dims(image_meta, 0),  # [1, META]
+            np.expand_dims(target_class_ids, 0),  # [1, T]
+            np.expand_dims(target_bbox, 0),  # [1, T, 6]
+            np.expand_dims(target_mask, 0),  # [1, T, mH, mW, mD, 1]
         ]
-        outputs = []  # лоссы считаем из внутренних loss-слоёв
-
-        return inputs, outputs
-
-    def _augment_head_features(self, rois_aligned, mask_aligned, target_mask):
-        """Безопасные аугментации для HEAD: только шум по признакам (без геометрии)."""
-        if not getattr(self.config, "AUGMENT", False):
-            return rois_aligned, mask_aligned, target_mask
-
-        prob = float(getattr(self.config, "AUG_PROB", 0.0) or 0.0)
-        if np.random.rand() >= prob:
-            return rois_aligned, mask_aligned, target_mask
-
-        sigma = float(getattr(self.config, "AUG_GAUSS_NOISE_STD", 0.0) or 0.0)
-        if sigma > 0.0:
-            rois_aligned = rois_aligned + np.random.normal(0.0, sigma, size=rois_aligned.shape).astype(np.float32)
-            mask_aligned = mask_aligned + np.random.normal(0.0, sigma, size=mask_aligned.shape).astype(np.float32)
-        return rois_aligned, mask_aligned, target_mask
-
-    def data_generator(self, image_ids):
-        if len(image_ids) == 0:
-            raise IndexError("Empty image_ids passed to data_generator.")
-        image_id = int(image_ids[0])
-
-        # грузим ПОЛНЫЕ таргеты (512 ROI, каналы == TOP_DOWN_PYRAMID_SIZE)
-        rois_aligned, mask_aligned, image_meta, target_class_ids, target_bbox, target_mask = self.load_image_gt(image_id)
-
-        # --- ЧАНКИРОВАНИЕ ROI БЕЗ ПОТЕРИ ДАННЫХ ---
-        total = int(rois_aligned.shape[0])                         # например, 512
-        T = int(getattr(self.config, "TRAIN_ROIS_PER_IMAGE", 128))  # размер окна (например, 128)
-        num_chunks = max(1, int(np.ceil(total / float(T))))
-
-        # циклично проходим чанки: за несколько шагов/эпох пройдём все ROI
-        # привязка к image_id слегка «перемешивает», чтобы разные образы не всегда начинались с одного чанка
-        chunk_id = (self._call_count + image_id) % num_chunks
-        self._call_count += 1
-
-        start = chunk_id * T
-        end = min(start + T, total)
-        idx_roi = np.arange(start, end, dtype=np.int32)
-
-        # вырезаем окно
-        ra = rois_aligned[idx_roi]
-        ma = mask_aligned[idx_roi]
-        tci = target_class_ids[idx_roi]
-        tb  = target_bbox[idx_roi]
-        tm  = target_mask[idx_roi]
-
-        # паддинг последнего чанка до T, чтобы совпасть с input shape модели
-        pad = T - ra.shape[0]
-        if pad > 0:
-            ra = np.pad(ra, ((0, pad),(0,0),(0,0),(0,0),(0,0)), mode="constant")
-            ma = np.pad(ma, ((0, pad),(0,0),(0,0),(0,0),(0,0)), mode="constant")
-            tci = np.pad(tci, ((0, pad),), mode="constant")
-            tb  = np.pad(tb,  ((0, pad),(0,0)), mode="constant")
-            tm  = np.pad(tm,  ((0, pad),(0,0),(0,0),(0,0)), mode="constant")
-
-        # аугментации (интенсивностные) ПРИМЕНЯЕМ к чанку
-        if self.training:
-            ra, ma, tm = self._augment_head_features(ra, ma, tm)
-
-        # собираем батч-ось
-        inputs = [
-            ra[np.newaxis, ...],
-            ma[np.newaxis, ...],
-            image_meta[np.newaxis, ...],
-            tci[np.newaxis, ...],
-            tb[np.newaxis, ...],
-            tm[np.newaxis, ..., np.newaxis],
-        ]
-        outputs = []
-
-        # self._debug_calls += 1
-        # if self._debug_calls <= 1:
-        #     print(f"[HeadGenerator] image_id={image_id} chunk {chunk_id+1}/{num_chunks} "
-        #           f"ROI {start}:{end} (T={T})", flush=True)
-        return inputs, outputs
-
-    def load_image_gt(self, image_id):
-        rois_aligned, mask_aligned, target_class_ids, target_bbox, target_mask = self.dataset.load_data(image_id)
-
-        # проверка каналов: должны совпасть с таргетами (обычно 256)
-        expected_c = int(getattr(self.config, "TOP_DOWN_PYRAMID_SIZE", rois_aligned.shape[-1]))
-        if rois_aligned.shape[-1] != expected_c:
-            raise ValueError(
-                f"[HeadGenerator] Channel mismatch: rois_aligned C={rois_aligned.shape[-1]}, "
-                f"config.TOP_DOWN_PYRAMID_SIZE={expected_c}. "
-                f"Не меняй TOP_DOWN_PYRAMID_SIZE без перегенерации таргетов."
-            )
-        if mask_aligned.shape[-1] != expected_c:
-            raise ValueError(
-                f"[HeadGenerator] mask_aligned C={mask_aligned.shape[-1]} != expected {expected_c}"
-            )
-
-        # даункаст типов (RAM/VRAM-экономия)
-        rois_aligned = np.asarray(rois_aligned, dtype=np.float16, order="C")
-        mask_aligned = np.asarray(mask_aligned, dtype=np.float16, order="C")
-        target_class_ids = np.asarray(target_class_ids, dtype=np.int16, order="C")
-        target_bbox = np.asarray(target_bbox, dtype=np.float16, order="C")
-        target_mask = (np.asarray(target_mask) > 0).astype(np.uint8, order="C")
-
-        # === КЛЮЧЕВОЕ: всегда активируем все классы датасета ===
-        # Иначе mrcnn_class_loss маскирует loss по классу 1, и модель «учится фону».
-        active_class_ids = np.ones([self.dataset.num_classes], dtype=np.int32)
-
-        # Собираем meta
-        image_meta = compose_image_meta(
-            image_id,
-            tuple(self.config.IMAGE_SHAPE),
-            tuple(self.config.IMAGE_SHAPE),
-            (0, 0, 0, *self.config.IMAGE_SHAPE[:-1]),
-            1.0,
-            active_class_ids
-        )
-
-        # sanity-check: есть ли вообще позитивы в этом image_id?
-        pos_cnt = int((target_class_ids > 0).sum())
-        if pos_cnt == 0:
-            # это не ошибка, но предупредим — такие батчи убивают обучение классификатора
-            print(f"[HeadGenerator][WARN] image_id={image_id} has ZERO positives for HEAD.", flush=True)
-
-        return rois_aligned, mask_aligned, image_meta, target_class_ids, target_bbox, target_mask
+        y = []  # лоссы добавлены через add_loss — явные y не нужны
+        return x, y
 
     def on_epoch_end(self):
         if self.shuffle:
             np.random.shuffle(self.image_ids)
+
+
+
+
 
 
 class RPNGenerator(keras.utils.Sequence):
@@ -708,45 +582,74 @@ class MrcnnGenerator(keras.utils.Sequence):
 
     def get_input_prediction(self, image_id):
         """
-        Собирает входы для инференса: [images, image_meta, anchors]
-        Возвращает: name (имя файла без пути) и inputs (в формате для model.predict)
+        Готовит входы для инференса ТОЧНО как в тренировке:
+          - изображение через dataset.load_image(image_id) (у вас там уже шкалирование в [-1, 1])
+          - active_class_ids как в __getitem__: включены классы текущего source
+          - корректная image_meta через compose_image_meta(...)
+          - anchors: нормированные self.anchors
+        Возвращает:
+          name  : базовое имя файла (без пути и расширения)
+          inputs: [images, image_meta, anchors] с батч-измерением
         """
-        from skimage.io import imread
         import numpy as np
 
-        image_path = self.dataset.image_info[image_id]["path"]
-        name = image_path.split("/")[-1]
+        info = self.dataset.image_info[image_id]
+        image = self.dataset.load_image(image_id).astype(np.float32)  # (H, W, D, 1) — как в train
+        name = info["path"].split("/")[-1].rsplit(".", 1)[0]
 
-        # meta: окно — весь кадр, scale=1, active_class_ids = [1]*NUM_CLASSES
+        # active_class_ids — как в __getitem__
+        active_class_ids = np.zeros([self.dataset.num_classes], dtype=np.int32)
+        source_class_ids = self.dataset.source_class_ids[info["source"]]
+        active_class_ids[source_class_ids] = 1
+
+        # meta: original=image_shape=CONFIG.IMAGE_SHAPE, окно — вся картинка, scale=1.0
         image_meta = compose_image_meta(
-            image_id,
-            tuple(self.config.IMAGE_SHAPE),
-            tuple(self.config.IMAGE_SHAPE),
-            (0, 0, 0, *self.config.IMAGE_SHAPE[:-1]),  # (y1,x1,z1,y2,x2,z2) в пикселях
-            1.0,
-            np.array([1 for _ in range(self.config.NUM_CLASSES)], dtype=np.int32)
-        )
+            image_id=image_id,
+            original_image_shape=tuple(self.config.IMAGE_SHAPE),
+            image_shape=tuple(self.config.IMAGE_SHAPE),
+            window=(0, 0, 0, *self.config.IMAGE_SHAPE[:-1]),  # (y1,x1,z1,y2,x2,z2)
+            scale=1.0,
+            active_class_ids=active_class_ids
+        ).astype(np.float32)
 
-        # чтение + приведение формы к (H,W,D,1), нормировка в [-1,1]
-        image = imread(image_path)  # ожидается (Z,Y,X)
-        if image.ndim == 3:
-            image = np.transpose(image, (1, 2, 0))  # (Y,X,Z) -> (H,W,D)
-        else:
-            raise ValueError(f"Unexpected image ndim={image.ndim} at {image_path}")
-        image = image.astype(np.float32) / 255.0
-        image = 2.0 * image - 1.0
-        image = image[..., np.newaxis]  # (H,W,D,1)
-
-        # батчевые контейнеры (BATCH_SIZE==1 для инференса)
-        batch_image_meta = np.zeros((self.batch_size,) + image_meta.shape, dtype=image_meta.dtype)
-        batch_images = np.zeros((self.batch_size,) + image.shape, dtype=np.float32)
-        batch_anchors = self.anchors[np.newaxis]
-
-        batch_image_meta[0] = image_meta
+        # батч=1
+        batch_images = np.zeros((1,) + image.shape, dtype=np.float32)
         batch_images[0] = image
+        batch_meta = np.zeros((1,) + image_meta.shape, dtype=np.float32)
+        batch_meta[0] = image_meta
+        batch_anchors = self.anchors[np.newaxis].astype(np.float32)
 
-        inputs = [batch_images, batch_image_meta, batch_anchors]
-        return name, inputs
+        return name, [batch_images, batch_meta, batch_anchors]
+
+    def load_image_gt(self, image_id):
+        """Load image and ground truth data with consistent processing."""
+        # Load image with proper preprocessing
+        image = self.dataset.load_image(image_id)
+
+        # In inference mode, we only need image and meta
+        if not self.training:
+            active_class_ids = np.zeros([self.dataset.num_classes], dtype=np.int32)
+            source_class_ids = self.dataset.source_class_ids[self.dataset.image_info[image_id]["source"]]
+            active_class_ids[source_class_ids] = 1
+            image_meta = compose_image_meta(
+                image_id,
+                tuple(self.config.IMAGE_SHAPE),
+                tuple(self.config.IMAGE_SHAPE),
+                (0, 0, 0, *self.config.IMAGE_SHAPE[:-1]),  # Full image window
+                1.0,  # Scale = 1.0
+                active_class_ids
+            )
+
+            # Also load GT data for metrics calculation during evaluation
+            try:
+                boxes, class_ids, masks = self.dataset.load_data(image_id)
+                return image, image_meta, boxes, class_ids, masks
+            except:
+                return image, image_meta
+
+        # For training, load all GT data
+        boxes, class_ids, masks = self.dataset.load_data(image_id)
+        return image, image_meta, boxes, class_ids, masks
 
 
 def compose_image_meta(image_id, original_image_shape, image_shape,
@@ -764,11 +667,11 @@ def compose_image_meta(image_id, original_image_shape, image_shape,
         where not all classes are present in all datasets.
     """
     meta = np.array(
-        [image_id] +  # size=1
+        [int(image_id)] +  # size=1
         list(original_image_shape) +  # size=4
         list(image_shape) +  # size=4
         list(window) +  # size=6 (y1, x1, z1, y2, x2, z2) in image coordinates
-        [scale] +  # size=1
+        [float(scale)] +  # size=1
         list(active_class_ids)  # size=num_classes
     )
     return meta #18 for num_classes = 2
@@ -796,7 +699,7 @@ def compute_backbone_shapes(config, image_shape):
             int(math.ceil(image_shape[1] / sx)),
             int(math.ceil(image_shape[2] / sz)),
         ])
-    return np.array(shapes)
+    return np.array(shapes, dtype=np.int32)
 
 
 ############################################################
@@ -826,6 +729,11 @@ class Dataset(object):
         self.class_info = [{"source": "", "id": 0, "name": "BG"}]
         self.source_class_ids = {}
 
+    def subset(self, image_ids):
+        import numpy as np, copy
+        view = copy.copy(self)  # неглубокая копия объекта
+        view._image_ids = np.asarray(image_ids, dtype=np.int32)
+        return view
     def filter_positive(self):
         """Оставляет только те image_ids, где есть хотя бы один позитивный объект.
         RPN: по boxes; HEAD: по target_class_ids>0.
@@ -927,7 +835,7 @@ class Dataset(object):
                 # Include BG class in all datasets
                 if i == 0 or source == info['source']:
                     self.source_class_ids[source].append(i)
-
+        self._image_ids = np.arange(self.num_images, dtype=np.int32)
     def map_source_class_id(self, source_class_id):
         """Takes a source class ID and returns the int class ID assigned to it.
 
@@ -957,38 +865,91 @@ class Dataset(object):
 class ToyDataset(Dataset):
 
     def load_dataset(self, data_dir, is_train=True):
-        '''
-        An image is defined in the dataset by:
-        # image_id, an image id [type: str of size 7]
-        # path, the path of its origin 3D image [type: str]
-        # seg_path, the path of the segmented 3D image [type: str]
-        # ann_time_step, the time step of the origin 3D image (for validation test) [type: str of size 3]
-        # ann_section_type, the type of section of the origin 3D image (x, y or z) [type: str of form 'x-section']
-        # ann_section_id, the index of the section in regard to the origin image [type: str of size 3]
-        # ann_mean = the mean of the origin 3D image pixel values [type: float]
-        # ann_std = the standard deviation of the origin 3D image pixel values
-        '''
-        self.add_class("dataset", 1, "neuron")
+        """
+        Универсальный лоадер:
+        - поддерживает названия колонок: images|image|img|path|image_path,
+                                         segs|seg|seg_path|labels|label_path,
+                                         cabs|cab|boxes|cab_path,
+                                         masks|mask|masks_path|mask_path
+        - автоматически определяет разделитель CSV (',' или ';')
+        - печатает, какие колонки реально использованы
+        """
+        import pandas as pd
+        import numpy as np
+        import os
 
-
-        if is_train:
-            td = pd.read_csv(f"{data_dir}datasets/train.csv", header=[0])
-            for i in range(len(td)):
-                img_path = td["images"][i]
-                seg_path = td["segs"][i]
-                cab_path = td["cabs"][i]
-                m_path = td["masks"][i]
-                self.add_image('dataset', image_id=i, path=img_path, seg_path=seg_path, cab_path=cab_path, m_path=m_path)
-            print('Training dataset is loaded.')
+        # объявим классы как в исходнике (оставляю как было)
+        cfg = getattr(self, "config", None)
+        if cfg and hasattr(cfg, "CLASS_NAMES"):
+            class_names = list(cfg.CLASS_NAMES)  # напр. ["neuron"] или ["rat_cell"]
+        elif cfg and hasattr(cfg, "NUM_CLASSES") and int(cfg.NUM_CLASSES) == 2:
+            class_names = ["neuron"]  # один foreground (+ BG)
         else:
-            td = pd.read_csv(f"{data_dir}datasets/test.csv", header=[0])
-            for i in range(len(td)):
-                img_path = td["images"][i]
-                seg_path = td["segs"][i]
-                cab_path = td["cabs"][i]
-                m_path = td["masks"][i]
-                self.add_image('dataset', image_id=i, path=img_path, seg_path=seg_path, cab_path=cab_path, m_path=m_path)
-            print('Validation dataset is loaded.')
+            class_names = ["ellipsoid", "cuboid", "pyramid"]  # бэкап как в исходнике
+
+        for i, name in enumerate(class_names, start=1):
+            self.add_class("dataset", i, name)
+
+        split = "train" if is_train else "test"
+        csv_path = os.path.join(data_dir, "datasets", f"{split}.csv")
+
+        # читаем CSV с авто-определением разделителя
+        try:
+            td = pd.read_csv(csv_path, sep=None, engine="python")
+        except Exception as e:
+            raise RuntimeError(f"[load_dataset] failed to read CSV: {csv_path} ({type(e).__name__}: {e})")
+
+        cols = {c.lower(): c for c in td.columns}  # lower->original
+
+        def pick(*candidates, required=True):
+            """берём первую существующую колонку из списка кандидатов (по lowercase-совпадению)"""
+            for cand in candidates:
+                key = cand.lower()
+                if key in cols:
+                    return cols[key]
+                # мягкий поиск по подстроке
+                for lc, orig in cols.items():
+                    if key in lc:
+                        return orig
+            if required:
+                raise KeyError(f"[load_dataset] none of columns {candidates} found in CSV. "
+                               f"Available: {list(td.columns)}")
+            return None
+
+        # подбираем реальные имена колонок
+        col_images = pick("images", "image", "img", "path", "image_path")
+        col_segs   = pick("segs", "seg", "seg_path", "labels", "label_path", required=False)
+        col_cabs   = pick("cabs", "cab", "boxes", "cab_path")
+        col_masks  = pick("masks", "mask", "masks_path", "mask_path")
+
+        print(f"[Dataset] Using columns -> images:'{col_images}', segs:'{col_segs}', "
+              f"cabs:'{col_cabs}', masks:'{col_masks}'")
+
+        # добавляем изображения
+        n = len(td)
+        for i in range(n):
+            img_path = td.at[i, col_images]
+            seg_path = td.at[i, col_segs]  if col_segs  is not None else None
+            cab_path = td.at[i, col_cabs]
+            m_path   = td.at[i, col_masks]
+
+            if not isinstance(img_path, str):
+                raise ValueError(f"[load_dataset] bad 'images' value at row {i}: {img_path}")
+            if not isinstance(cab_path, str):
+                raise ValueError(f"[load_dataset] bad 'cabs' value at row {i}: {cab_path}")
+            if not isinstance(m_path, str):
+                raise ValueError(f"[load_dataset] bad 'masks' value at row {i}: {m_path}")
+
+            self.add_image(
+                'dataset',
+                image_id=i,
+                path=img_path,
+                seg_path=seg_path,
+                cab_path=cab_path,
+                m_path=m_path
+            )
+
+        print('Training dataset is loaded.' if is_train else 'Validation dataset is loaded.')
 
     def load_image(self, image_id, z_slice=None):
         """Load the specified image and return a [H,W,3] Numpy array.

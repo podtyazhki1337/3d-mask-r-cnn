@@ -19,6 +19,7 @@ class Config(object):
         # Data
         DATA_DIR = "data/",
         NUM_CLASSES = 2,
+        CLASS_NAMES  = ["neuron"],
         IMAGE_SIZE = 256,
         IMAGE_DEPTH = 12,
         IMAGE_CHANNEL_COUNT = 1,
@@ -122,6 +123,7 @@ class Config(object):
 
         # Number of classes (including background)
         self.NUM_CLASSES = NUM_CLASSES
+        self.CLASS_NAMES=CLASS_NAMES
 
         # Input image size
         self.IMAGE_SIZE = IMAGE_SIZE

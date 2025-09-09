@@ -1,3 +1,4 @@
+import platform
 import logging
 import random
 import numpy as np
@@ -13,6 +14,11 @@ from collections import defaultdict as _dd
 
 from .data_generators import RPNGenerator, HeadGenerator
 
+
+if platform.processor() == 'ppc64le':
+    import core.custom_op.ppc64le_custom_op as custom_op
+else:
+    import core.custom_op.custom_op as custom_op
 
 ############################################################
 #  Bounding Boxes
@@ -117,65 +123,181 @@ def compute_overlaps_masks(masks1, masks2):
     return overlaps
 
 
-def apply_box_deltas_3d(boxes, deltas):
-    """Применяет предсказанные дельты к якорям.
-
-    boxes: [N, (y1, x1, z1, y2, x2, z2)] якоря в формате координат
-    deltas: [N, (dy, dx, dz, log(dh), log(dw), log(dd))] предсказанные дельты
-
-    Возвращает: [N, (y1, x1, z1, y2, x2, z2)] преобразованные боксы
+def apply_box_deltas_3d(boxes, deltas, bbox_std_dev=None):
     """
-    # Конвертируем якоря из [y1, x1, z1, y2, x2, z2] в [cy, cx, cz, h, w, d]
-    height = boxes[:, 3] - boxes[:, 0]
-    width = boxes[:, 4] - boxes[:, 1]
-    depth = boxes[:, 5] - boxes[:, 2]
-    center_y = boxes[:, 0] + 0.5 * height
-    center_x = boxes[:, 1] + 0.5 * width
-    center_z = boxes[:, 2] + 0.5 * depth
+    Универсальная обёртка: работает и с TF-тензорами (граф), и с NumPy.
+    При наличии bbox_std_dev денормализует дельты (как на тренировке).
+    boxes : [N,6] (y1,x1,z1,y2,x2,z2)
+    deltas: [N,6] (dy,dx,dz, log(dh),log(dw),log(dd))
+    bbox_std_dev: None или [6]
+    """
+    # Если это TF-тензоры — отправляем в графовую реализацию.
+    try:
+        if tf.is_tensor(boxes) or tf.is_tensor(deltas):
+            if bbox_std_dev is None:
+                bbox_std_dev = tf.ones([6], dtype=tf.float32)
+            return apply_box_deltas_3d_graph(boxes, deltas, bbox_std_dev)
+    except NameError:
+        # tf не импортирован — упадём в NumPy путь ниже
+        pass
 
-    # Избегаем очень маленьких размеров для стабильности
-    height = np.maximum(height, 1)
-    width = np.maximum(width, 1)
-    depth = np.maximum(depth, 1)
+    # --- NumPy путь (eval/offline) ---
+    boxes = np.asarray(boxes, dtype=np.float32)
+    deltas = np.asarray(deltas, dtype=np.float32)
+    if bbox_std_dev is not None:
+        deltas = deltas * np.asarray(bbox_std_dev, dtype=np.float32)
 
-    # Распаковываем дельты
-    center_y_delta = deltas[:, 0]
-    center_x_delta = deltas[:, 1]
-    center_z_delta = deltas[:, 2]
-    height_log_delta = deltas[:, 3]
-    width_log_delta = deltas[:, 4]
-    depth_log_delta = deltas[:, 5]
+    # в центры/размеры
+    h = boxes[:, 3] - boxes[:, 0]
+    w = boxes[:, 4] - boxes[:, 1]
+    d = boxes[:, 5] - boxes[:, 2]
+    cy = boxes[:, 0] + 0.5 * h
+    cx = boxes[:, 1] + 0.5 * w
+    cz = boxes[:, 2] + 0.5 * d
 
-    # ВАЖНО: Ограничиваем большие значения для предотвращения экспоненциальных выбросов
-    # Это критично для стабильности предсказаний
-    height_log_delta = np.clip(height_log_delta, -4, 4)
-    width_log_delta = np.clip(width_log_delta, -4, 4)
-    depth_log_delta = np.clip(depth_log_delta, -4, 4)
+    h = np.maximum(h, 1.0)
+    w = np.maximum(w, 1.0)
+    d = np.maximum(d, 1.0)
 
-    # Применяем дельты
-    center_y = center_y + center_y_delta * height
-    center_x = center_x + center_x_delta * width
-    center_z = center_z + center_z_delta * depth
-    height = height * np.exp(height_log_delta)
-    width = width * np.exp(width_log_delta)
-    depth = depth * np.exp(depth_log_delta)
+    dy, dx, dz, dh, dw, dd = deltas.T
+    # защита от экспоненциальных выбросов
+    dh = np.clip(dh, -4.0, 4.0)
+    dw = np.clip(dw, -4.0, 4.0)
+    dd = np.clip(dd, -4.0, 4.0)
 
-    # Ограничиваем размеры для предотвращения вырожденных боксов
-    height = np.maximum(height, 1)
-    width = np.maximum(width, 1)
-    depth = np.maximum(depth, 1)
+    cy = cy + dy * h
+    cx = cx + dx * w
+    cz = cz + dz * d
+    h  = h * np.exp(dh)
+    w  = w * np.exp(dw)
+    d  = d * np.exp(dd)
 
-    # Конвертируем обратно в [y1, x1, z1, y2, x2, z2]
-    y1 = center_y - 0.5 * height
-    x1 = center_x - 0.5 * width
-    z1 = center_z - 0.5 * depth
-    y2 = y1 + height
-    x2 = x1 + width
-    z2 = z1 + depth
+    h = np.maximum(h, 1.0)
+    w = np.maximum(w, 1.0)
+    d = np.maximum(d, 1.0)
 
-    # Склеиваем результаты
+    y1 = cy - 0.5 * h
+    x1 = cx - 0.5 * w
+    z1 = cz - 0.5 * d
+    y2 = y1 + h
+    x2 = x1 + w
+    z2 = z1 + d
     return np.stack([y1, x1, z1, y2, x2, z2], axis=1)
 
+def norm_boxes_3d_graph(boxes, image_shape):
+    """ boxes [N,6] px -> norm по (H-1,W-1,D-1). """
+    boxes = tf.cast(boxes, tf.float32)
+    image_shape = tf.cast(image_shape, tf.float32)  # [H,W,D]
+    h, w, d = image_shape[0], image_shape[1], image_shape[2]
+    scale = tf.stack([h - 1.0, w - 1.0, d - 1.0, h - 1.0, w - 1.0, d - 1.0])
+    out = boxes / scale
+    # фиксируем known last-dim
+    out.set_shape([None, 6])
+    return out
+
+def denorm_boxes_3d_graph(boxes, image_shape):
+    """ boxes [N,6] norm -> px по (H-1,W-1,D-1). """
+    boxes = tf.cast(boxes, tf.float32)
+    image_shape = tf.cast(image_shape, tf.float32)  # [H,W,D]
+    h, w, d = image_shape[0], image_shape[1], image_shape[2]
+    scale = tf.stack([h - 1.0, w - 1.0, d - 1.0, h - 1.0, w - 1.0, d - 1.0])
+    out = boxes * scale
+    out.set_shape([None, 6])
+    return out
+
+# === SAFE-реализация применения 3D-дельт (полная замена) ===
+def apply_box_deltas_3d_graph(boxes, deltas, bbox_std_dev):
+    """
+    TF-версия. Применяет дельты к 3D боксам (px-координаты).
+    boxes : [N,6]  (y1,x1,z1,y2,x2,z2)  в пикселях
+    deltas: [N,6]  (dy,dx,dz, log(dh),log(dw),log(dd)) — НОРМАЛИЗОВАНЫ (умножим ниже на std)
+    bbox_std_dev: [6]
+    return: [N,6] в пикселях
+    """
+    boxes = tf.cast(boxes, tf.float32)
+    deltas = tf.cast(deltas, tf.float32)
+    bbox_std_dev = tf.cast(bbox_std_dev, tf.float32)
+
+    # гарантируем известную последнюю ось
+    boxes.set_shape([None, 6])
+    deltas.set_shape([None, 6])
+
+    # денормализация дельт по std чтобы совпадать с тренировкой
+    deltas = deltas * bbox_std_dev
+
+    # разбивка без требований к статической форме
+    y1, x1, z1, y2, x2, z2 = [tf.squeeze(t, axis=1) for t in tf.split(boxes, 6, axis=1)]
+    dy, dx, dz, dh, dw, dd = [tf.squeeze(t, axis=1) for t in tf.split(deltas, 6, axis=1)]
+
+    h  = y2 - y1
+    w  = x2 - x1
+    d  = z2 - z1
+    cy = y1 + 0.5 * h
+    cx = x1 + 0.5 * w
+    cz = z1 + 0.5 * d
+
+    # стабилизация масштабов (как у Matterport)
+    LOG_SCALE_LIMIT = tf.math.log(1000.0 / 16.0)
+    dh = tf.clip_by_value(dh, -LOG_SCALE_LIMIT, LOG_SCALE_LIMIT)
+    dw = tf.clip_by_value(dw, -LOG_SCALE_LIMIT, LOG_SCALE_LIMIT)
+    dd = tf.clip_by_value(dd, -LOG_SCALE_LIMIT, LOG_SCALE_LIMIT)
+
+    cy2 = cy + dy * h
+    cx2 = cx + dx * w
+    cz2 = cz + dz * d
+    h2  = h * tf.exp(dh)
+    w2  = w * tf.exp(dw)
+    d2  = d * tf.exp(dd)
+
+    y1n = cy2 - 0.5 * h2
+    x1n = cx2 - 0.5 * w2
+    z1n = cz2 - 0.5 * d2
+    y2n = y1n + h2
+    x2n = x1n + w2
+    z2n = z1n + d2
+
+    out = tf.stack([y1n, x1n, z1n, y2n, x2n, z2n], axis=1)
+    out.set_shape([None, 6])
+    return out
+
+
+def non_max_suppression_3d_graph(boxes, scores, threshold, max_boxes):
+    """
+    Графовый враппер над custom_op.non_max_suppression_3d.
+    Вход:
+      boxes   : [N,6] float32 (y1,x1,z1,y2,x2,z2)
+      scores  : [N]   float32
+      threshold: float (IoU)   <-- Python float
+      max_boxes: int           <-- Python int
+    Выход:
+      selected_boxes: [M,6] float32
+      keep_indices  : [M] int32
+    """
+    import tensorflow as tf
+
+    # гарантируем тензорные типы для boxes/scores
+    boxes  = tf.cast(boxes,  tf.float32)
+    scores = tf.cast(scores, tf.float32)
+
+    # custom op ожидает ПИТОНОВСКИЕ скаляры для порога и лимита
+    try:
+        thr = float(threshold)
+    except Exception:
+        v = tf.get_static_value(threshold)
+        thr = float(v) if v is not None else 0.3
+
+    try:
+        mxb = int(max_boxes)
+    except Exception:
+        v = tf.get_static_value(max_boxes)
+        mxb = int(v) if v is not None else 200
+
+    keep = custom_op.non_max_suppression_3d(
+        boxes, scores, mxb, thr, name="nms3d_graph"
+    )
+    selected = tf.gather(boxes, keep)
+    selected.set_shape([None, 6])
+    return selected, keep
 
 def non_max_suppression_3d(boxes, scores, threshold, max_boxes=2000):
     """Улучшенная функция NMS для 3D детекции.

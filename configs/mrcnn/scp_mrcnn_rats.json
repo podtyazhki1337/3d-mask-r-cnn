@@ -1,6 +1,7 @@
 {   
     "DATA_DIR": "/NAS/mmaiurov/Datasets/rat_neurons_3d_tif_256_patches/",
     "NUM_CLASSES": 2,
+    "CLASS_NAMES": ["neuron"],
     "IMAGE_SIZE": 256,
     "IMAGE_DEPTH": 12,
     "IMAGE_CHANNEL_COUNT": 1,
@@ -21,7 +22,9 @@
     "ROI_POSITIVE_RATIO": 0.5,
     "FPN_CLASSIF_FC_LAYERS_SIZE": 512,
     "DETECTION_MAX_INSTANCES": 40,
-    "DETECTION_MIN_CONFIDENCE": 0.35,
+
+    "DETECTION_MIN_CONFIDENCE": 0.1,
+    "DETECTION_NMS_THRESHOLD": 0.3,
 
     "GPU_COUNT": 1, 
     "IMAGES_PER_GPU": 1,
@@ -38,8 +41,13 @@
     "RPN_ANCHOR_RATIOS": [0.04, 0.06, 0.08, 0.01, 0.11, 0.12],
     "RPN_ANCHOR_STRIDE":  1,
     "RPN_BBOX_STD_DEV": [0.10, 0.10, 0.08, 0.20, 0.20, 0.15],
-    "HEAD_CONV_CHANNEL": 128,
-    "DETECTION_NMS_THRESHOLD": 0.45,
+
+    "POOL_SIZE": 7,
+    "MASK_POOL_SIZE": 14,
+
+    "RPN_NMS_THRESHOLD": 0.70,
+    "HEAD_CONV_CHANNEL": 256,
+
     "ATSS_TOPK": 12,
     "ATSS_MIN_POS_PER_GT": 3,
     "AUGMENT": false
