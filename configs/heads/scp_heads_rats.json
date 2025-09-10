@@ -23,7 +23,7 @@
     "IMAGES_PER_GPU": 1,
     "GPU_COUNT": 1,
     "LOSS_WEIGHTS": {"mrcnn_class_loss": 1.0, "mrcnn_bbox_loss": 1.0, "mrcnn_mask_loss": 1.0, "mrcnn_obj_loss": 0.5, "mrcnn_margin_loss": 0.0},
-    "OPTIMIZER": {"name": "ADADELTA", "parameters": {"learning_rate": 1e-3}},
+    "OPTIMIZER": {"name": "ADAM", "parameters": {"lr": 3e-4,"beta_1": 0.9, "beta_2": 0.999, "clipnorm": 5.0}},
     "WEIGHT_DIR": "./weights/scp_heads_rats/",
     "EPOCHS": 100,
     "FROM_EPOCH": 0,

@@ -20,18 +20,40 @@ import keras.models as KM
 # ---- ЕДИНЫЙ TF1-стиль графа и один сеанс ----
 tf.compat.v1.disable_eager_execution()
 K.clear_session()
+
 _tf_config = tf.compat.v1.ConfigProto()
 _tf_config.gpu_options.allow_growth = True
-_tf_sess = tf.compat.v1.Session(config=_tf_config)
+_TF_SESSION = tf.compat.v1.Session(config=_tf_config)
+
+# Привязываем сессию к Keras (и к tf.compat)
 try:
-    # Привязываем TF1-сессию к backend Keras
-    K.set_session(_tf_sess)
-    # Для некоторых сборок ещё полезно синхронизировать через tf.compat.v1.keras
-    tf.compat.v1.keras.backend.set_session(_tf_sess)
+    K.set_session(_TF_SESSION)
+    tf.compat.v1.keras.backend.set_session(_TF_SESSION)
 except Exception as e:
     print("[tf-compat] set_session warn:", e)
+def _get_value_safe(x):
+    # numpy/скаляры возвращаем как есть
+    if isinstance(x, (float, int, np.floating, np.integer, np.ndarray)):
+        return np.asarray(x)
 
+    # Для тензоров/переменных TF — eval через единую сессию
+    try:
+        import tensorflow as _tf
+        if isinstance(x, (_tf.Tensor, _tf.Variable)):
+            return _TF_SESSION.run(x)
+    except Exception:
+        pass
 
+    # Фолбэк: если вдруг кто-то включит eager где-то локально
+    if hasattr(x, "numpy"):
+        try:
+            return x.numpy()
+        except Exception:
+            pass
+
+    return x
+keras.backend.get_value = _get_value_safe
+K.get_value = _get_value_safe
 
 if platform.processor() == 'ppc64le':
     import core.custom_op.ppc64le_custom_op as custom_op
@@ -70,6 +92,15 @@ class BatchNorm(KL.BatchNormalization):
         """
         return super(self.__class__, self).call(inputs, training=training)
 
+def _keras_opt_params(p):
+    p = dict(p or {})
+    if 'learning_rate' in p and 'lr' not in p:
+        p['lr'] = p.pop('learning_rate')
+    if 'beta1' in p and 'beta_1' not in p:
+        p['beta_1'] = p.pop('beta1')
+    if 'beta2' in p and 'beta_2' not in p:
+        p['beta_2'] = p.pop('beta2')
+    return p
 
 def compute_backbone_shapes(config, image_shape):
     """Computes the width and height of each stage of the backbone network.
@@ -1302,124 +1333,116 @@ def rpn_bbox_loss_graph(images_per_gpu, target_bbox, rpn_match, rpn_bbox):
     return tf.cond(tf.equal(tf.size(pos_indices), 0), no_pos, compute_loss)
 
 
-
-
-
-def mrcnn_class_loss_graph(target_class_ids, pred_class_logits,
-                           active_class_ids):
+def mrcnn_class_loss_graph(target_class_ids, pred_class_logits, active_class_ids):
     """
-    Loss for the classifier head of Mask RCNN.
-
-    target_class_ids: [batch, num_rois]. Integer class IDs. Uses zero
-        padding to fill in the array.
-    pred_class_logits: [batch, num_rois, num_classes]
-    active_class_ids: [batch, num_classes]. Has a value of 1 for
-        classes that are in the dataset of the image, and 0
-        for classes that are not in the dataset.
+    target_class_ids: [B, T] int32
+    pred_class_logits: [B, T, C] (logits)
+    active_class_ids: [1, C]
     """
+    target_class_ids = tf.cast(target_class_ids, tf.int64)
 
-    # During model building, Keras calls this function with
-    # target_class_ids of type float32. Unclear why. Cast it
-    # to int to get around it.
-    target_class_ids = tf.cast(target_class_ids, 'int64')
+    B = tf.shape(pred_class_logits)[0]
+    T = tf.shape(pred_class_logits)[1]
+    C = tf.shape(pred_class_logits)[2]
 
-    # Find predictions of classes that are not in the dataset.
-    pred_class_ids = tf.argmax(pred_class_logits, axis=2)
-    pred_active = tf.gather(active_class_ids[0], pred_class_ids)
+    logits_flat = tf.reshape(pred_class_logits, [B * T, C])   # [BT, C]
+    target_flat = tf.reshape(target_class_ids, [B * T])       # [BT]
 
-    # Loss
-    loss = tf.nn.sparse_softmax_cross_entropy_with_logits(
-        labels=target_class_ids, 
-        logits=pred_class_logits
-    )
+    # Маскируем по ИСТИННОМУ классу (а не по argmax предсказания)
+    true_active = tf.gather(active_class_ids[0], target_flat) # [BT] в {0,1}
 
-    # Erase losses of predictions of classes that are not in the active
-    # classes of the image.
-    loss = loss * pred_active
+    ce = tf.nn.sparse_softmax_cross_entropy_with_logits(
+        labels=target_flat, logits=logits_flat
+    )                                                         # [BT]
+    ce = ce * tf.cast(true_active, ce.dtype)
 
-    # Computer loss mean. Use only predictions that contribute
-    # to the loss to get a correct mean.
-    loss = tf.reduce_sum(loss) / tf.reduce_sum(pred_active)
-
-    return loss
+    denom = tf.maximum(tf.reduce_sum(tf.cast(true_active, ce.dtype)), K.epsilon())
+    return tf.reduce_sum(ce) / denom
 
 
 def mrcnn_bbox_loss_graph(target_bbox, target_class_ids, pred_bbox):
     """
-    Loss for Mask R-CNN bounding box refinement.
-
-    target_bbox: [batch, num_rois, (dy, dx, log(dh), log(dw))]
-    target_class_ids: [batch, num_rois]. Integer class IDs.
-    pred_bbox: [batch, num_rois, num_classes, (dy, dx, log(dh), log(dw))]
+    target_bbox: [B, T, 6] (dy, dx, dz, log(dh), log(dw), log(dd))
+    target_class_ids: [B, T]
+    pred_bbox: [B, T, C, 6]
     """
+    target_class_ids = tf.cast(target_class_ids, tf.int64)
 
-    # Reshape to merge batch and roi dimensions for simplicity.
-    target_class_ids = K.reshape(target_class_ids, (-1,))
-    target_bbox = K.reshape(target_bbox, (-1, 6))
-    pred_bbox = K.reshape(pred_bbox, (-1, K.int_shape(pred_bbox)[2], 6))
+    B = tf.shape(target_bbox)[0]
+    T = tf.shape(target_bbox)[1]
 
-    # Only positive ROIs contribute to the loss. And only
-    # the right class_id of each ROI. Get their indices.
-    positive_roi_ix = tf.where(target_class_ids > 0)[:, 0]
-    positive_roi_class_ids = tf.cast(
-        tf.gather(target_class_ids, positive_roi_ix), 
-        tf.int64
-    )
-    indices = tf.stack([positive_roi_ix, positive_roi_class_ids], axis=1)
+    y_true = tf.reshape(target_bbox, [B * T, 6])      # [BT, 6]
+    cls    = tf.reshape(target_class_ids, [B * T])    # [BT]
+    y_pred = tf.reshape(pred_bbox,   [B * T, -1, 6])  # [BT, C, 6]
 
-    # Gather the deltas (predicted and true) that contribute to loss
-    target_bbox = tf.gather(target_bbox, positive_roi_ix)
-    pred_bbox = tf.gather_nd(pred_bbox, indices)
+    pos_ix = tf.where(cls > 0)[:, 0]                  # [N_pos]
 
-    # Smooth-L1 Loss
-    loss = K.switch(tf.size(target_bbox) > 0,
-                    smooth_l1(y_true=target_bbox, y_pred=pred_bbox),
-                    tf.constant(0.0))
-    loss = K.mean(loss)
+    def _no_pos():
+        return tf.cast(0.0, K.floatx())
 
-    return loss
+    def _with_pos():
+        yt = tf.gather(y_true, pos_ix)                # [N_pos, 6]
+        pc = tf.gather(cls, pos_ix)                   # [N_pos]
+        yp = tf.gather(y_pred, pos_ix)                # [N_pos, C, 6]
+        N  = tf.shape(pos_ix)[0]
+        idx = tf.stack([tf.range(N, dtype=tf.int64), tf.cast(pc, tf.int64)], axis=1)
+        yp_cls = tf.gather_nd(yp, idx)                # [N_pos, 6]
 
+        # ИСПОЛЬЗУЕМ ТВОЮ smooth_l1 (элементно) → среднее по координатам → среднее по ROI
+        per_coord = smooth_l1(yt, yp_cls)             # [N_pos, 6]
+        per_roi   = K.mean(per_coord, axis=-1)        # [N_pos]
+        return K.mean(per_roi)
+
+    return tf.cond(tf.size(pos_ix) > 0, _with_pos, _no_pos)
 
 def mrcnn_mask_loss_graph(target_masks, target_class_ids, pred_masks):
     """
-    Mask binary cross-entropy loss for the masks head.
-
-    target_masks: [batch, num_rois, height, width, depth].
-        A float32 tensor of values 0 or 1. Uses zero padding to fill array.
-    target_class_ids: [batch, num_rois]. Integer class IDs. Zero padded.
-    pred_masks: [batch, proposals, height, width, depth, num_classes] float32 tensor
-                with values from 0 to 1.
+    target_masks: [batch, num_rois, mH, mW, mD, 1]  (0/1)
+    target_class_ids: [batch, num_rois] int32
+    pred_masks: [batch, num_rois, M, M, M, num_classes]  (УЖЕ sigmoid → вероятности)
+    Возвращает скалярный BCE-loss по позитивным ROI и соответствующим классам.
     """
+    # [BT]
+    target_class_ids = tf.cast(target_class_ids, tf.int64)
+    B = tf.shape(target_masks)[0]
+    T = tf.shape(target_masks)[1]
+    C = tf.shape(pred_masks)[5]
 
-    # Reshape for simplicity. Merge first two dimensions into one.
-    target_class_ids = K.reshape(target_class_ids, (-1,))
-    mask_shape = tf.shape(target_masks)
-    target_masks = K.reshape(target_masks, (-1, mask_shape[2], mask_shape[3], mask_shape[4]))
-    pred_shape = tf.shape(pred_masks)
-    pred_masks = K.reshape(pred_masks,
-                           (-1, pred_shape[2], pred_shape[3], pred_shape[4], pred_shape[5]))
-    
-    # Permute predicted masks to [N, num_classes, height, width]
-    pred_masks = tf.transpose(pred_masks, [0, 4, 1, 2, 3])
+    # Свести воксели в один размер V
+    # y_true: [BT, V], y_pred: [BT, V, C], cls: [BT]
+    y_true = tf.reshape(target_masks, [B * T, -1])
+    y_pred = tf.reshape(pred_masks,   [B * T, -1, C])
+    cls    = tf.reshape(target_class_ids, [B * T])
 
-    # Only positive ROIs contribute to the loss. And only
-    # the class specific mask of each ROI.
-    positive_ix = tf.where(target_class_ids > 0)[:, 0]
-    positive_class_ids = tf.cast(tf.gather(target_class_ids, positive_ix), tf.int64)
-    indices = tf.stack([positive_ix, positive_class_ids], axis=1)
+    # Только положительные ROI
+    pos_ix = tf.where(cls > 0)[:, 0]
 
-    # Gather the masks (predicted and true) that contribute to loss
-    y_true = tf.gather(target_masks, positive_ix)
-    y_pred = tf.gather_nd(pred_masks, indices)
+    def _no_pos():
+        return tf.cast(0.0, K.floatx())
 
-    # Compute binary cross entropy. If no positive ROIs, then return 0.
-    # shape: [batch, roi, num_classes]
-    loss = K.switch(tf.size(y_true) > 0,
-                    K.binary_crossentropy(target=y_true, output=y_pred),
-                    tf.constant(0.0))
-    loss = K.mean(loss)
+    def _with_pos():
+        yt = tf.gather(y_true, pos_ix)   # [N_pos, V]
+        yp = tf.gather(y_pred, pos_ix)   # [N_pos, V, C]
+        pc = tf.gather(cls, pos_ix)      # [N_pos]
 
-    return loss
+        # выбрать канал ИСТИННОГО класса → [N_pos, V]
+        yp_t  = tf.transpose(yp, [0, 2, 1])  # [N_pos, C, V]
+        Npos  = tf.shape(pos_ix)[0]
+        idx   = tf.stack([tf.range(Npos, dtype=tf.int64), tf.cast(pc, tf.int64)], axis=1)
+        yp_cls = tf.gather_nd(yp_t, idx)     # [N_pos, V]
+
+        # BCE по вероятностям (выход mrcnn_mask — sigmoid)
+        yp_cls = K.clip(yp_cls, K.epsilon(), 1.0 - K.epsilon())
+        # K.binary_crossentropy редуцирует ПО ПОСЛЕДНЕЙ ОСИ → [N_pos]
+        loss_vec = K.binary_crossentropy(target=yt, output=yp_cls)
+        # итог — среднее по всем ROI
+        return K.mean(loss_vec)
+
+    return tf.cond(tf.size(pos_ix) > 0, _with_pos, _no_pos)
+
+
+
+
 
 
 ############################################################
@@ -2259,27 +2282,15 @@ class RPN():
         self.keras_model.metrics_tensors = []
 
         # Создаем оптимизатор с улучшенными настройками
-        if self.config.OPTIMIZER["name"] == "SGD":
-            # Получаем параметры из конфига
-            optimizer_params = self.config.OPTIMIZER["parameters"].copy()
+        opt_name = str(self.config.OPTIMIZER.get("name", "SGD")).upper()
+        oparams = _keras_opt_params(self.config.OPTIMIZER.get("parameters", {}))
 
-            # Создаем Keras оптимизатор с clipnorm для стабильности
-            optimizer = keras.optimizers.SGD(
-                learning_rate=optimizer_params.get("learning_rate", 0.0001),
-                momentum=optimizer_params.get("momentum", 0.9),
-                decay=optimizer_params.get("decay", 1e-5),
-                clipnorm=1.0  # Ограничение нормы градиентов
-            )
+        if opt_name == "SGD":
+            optimizer = keras.optimizers.SGD(**oparams)
+        elif opt_name == "ADADELTA":
+            optimizer = keras.optimizers.Adadelta(**oparams)
         else:
-            optimizer_params = self.config.OPTIMIZER["parameters"].copy()
-            optimizer = keras.optimizers.Adam(
-                learning_rate=optimizer_params.get("learning_rate", 0.0001),
-                beta_1=optimizer_params.get("beta_1", 0.9),
-                beta_2=optimizer_params.get("beta_2", 0.999),
-                epsilon=optimizer_params.get("epsilon", 1e-7),
-                clipnorm=1.0  # Ограничение нормы градиентов
-            )
-
+            optimizer = keras.optimizers.Adam(**oparams)
         # Add Losses
         # First, clear previously set losses to avoid duplication
         self.keras_model._losses = []
@@ -2395,6 +2406,7 @@ class RPN():
             max_queue_size=20,
             workers=1,
             use_multiprocessing=False,
+
         )
     
     def get_anchors(self, image_shape):
@@ -2761,7 +2773,8 @@ class HEAD():
         opt_cfg = getattr(self.config, "OPTIMIZER",
                           {"name": "SGD", "parameters": {"learning_rate": 1e-3, "momentum": 0.9}})
         oname = str(opt_cfg.get("name", "SGD")).upper()
-        oparams = dict(opt_cfg.get("parameters", {}))
+        oparams = _keras_opt_params(opt_cfg.get("parameters", {}))
+
         if oname == "SGD":
             optimizer = keras.optimizers.SGD(**oparams)
         elif oname == "ADADELTA":
@@ -2769,16 +2782,16 @@ class HEAD():
         else:
             optimizer = keras.optimizers.Adam(**oparams)
 
-        # Компиляция: лоссы уже добавлены через add_loss
+        # Лоссы добавлены через add_loss — компиляция без явных целевых выходов
         m.compile(optimizer=optimizer, loss=[None] * len(m.outputs))
 
     def train(self):
         assert self.config.MODE == "training", "Create model in training mode."
 
-        # Улучшение: разделяем датасет на train/val (80/20)
+        # Улучшение: разделяем датасет на train/val (90/10)
         train_ids = self.train_dataset.image_ids
         np.random.shuffle(train_ids)
-        split = int(0.8 * len(train_ids))
+        split = int(0.9 * len(train_ids))
         train_ids, val_ids = train_ids[:split], train_ids[split:]
 
         # Генераторы с улучшенной нормализацией (z-score)
@@ -2802,10 +2815,10 @@ class HEAD():
         save_weights = BestAndLatestCheckpoint(save_path=self.config.WEIGHT_DIR, mode='MRCNN')
 
         # Улучшение: дополнительные callbacks
-        from keras.callbacks import EarlyStopping, ReduceLROnPlateau, TensorBoard
+        from keras.callbacks import EarlyStopping, ReduceLROnPlateau
         early_stop = EarlyStopping(monitor='val_loss', patience=10, verbose=1)
         reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5, verbose=1)
-        tensorboard = TensorBoard(log_dir=os.path.join(self.config.WEIGHT_DIR, 'logs'))
+
 
         # Model compilation
         self.compile()
@@ -2829,35 +2842,30 @@ class HEAD():
             initial_epoch=self.config.FROM_EPOCH,
             epochs=self.config.FROM_EPOCH + self.config.EPOCHS,
             steps_per_epoch=len(train_ids),
-            callbacks=[save_weights, early_stop, reduce_lr, tensorboard],
+            callbacks=[save_weights, early_stop, reduce_lr],
             validation_data=val_generator,
             validation_steps=len(val_ids),
-            max_queue_size=30,
+            max_queue_size=1,
             workers=workers,
-            use_multiprocessing=False,
+            use_multiprocessing=False, # обязательно False в TF1
+            shuffle=False,
+            verbose=1
         )
 
 
 from keras import backend as K
 
 def _ensure_tf1_graph():
-    """Переводим среду в режим TF1-графа: disable eager, clear_session, set Session(allow_growth)."""
     try:
-        if hasattr(tf, "executing_eagerly") and tf.executing_eagerly():
-            tf1.disable_eager_execution()
+        tf.compat.v1.disable_eager_execution()
     except Exception:
         pass
+    # Никаких K.clear_session() здесь — иначе потеряем привязанную сессию!
     try:
-        K.clear_session()
-    except Exception:
-        pass
-    try:
-        cfg = tf1.ConfigProto()
-        cfg.gpu_options.allow_growth = True
-        sess = tf1.Session(config=cfg)
-
+        K.set_session(_TF_SESSION)
+        tf.compat.v1.keras.backend.set_session(_TF_SESSION)
     except Exception as e:
-        print("[tf-compat] session init warn:", e)
+        print("[tf-compat] _ensure_tf1_graph set_session warn:", e)
 
 class MaskRCNN():
     """Encapsulates the whole Mask RCNN model functionality.
@@ -3403,12 +3411,15 @@ class MaskRCNN():
         self.keras_model.metrics_tensors = []
 
         # Use Adam by default for better convergence
-        if self.config.OPTIMIZER["name"] == "ADADELTA":
-            optimizer = keras.optimizers.Adadelta(**self.config.OPTIMIZER["parameters"])
-        elif self.config.OPTIMIZER["name"] == "SGD":
-            optimizer = keras.optimizers.SGD(**self.config.OPTIMIZER["parameters"])
+        opt_name = str(self.config.OPTIMIZER.get("name", "SGD")).upper()
+        oparams = _keras_opt_params(self.config.OPTIMIZER.get("parameters", {}))
+
+        if opt_name == "SGD":
+            optimizer = keras.optimizers.SGD(**oparams)
+        elif opt_name == "ADADELTA":
+            optimizer = keras.optimizers.Adadelta(**oparams)
         else:
-            optimizer = keras.optimizers.Adam(learning_rate=0.001)  # Default Adam
+            optimizer = keras.optimizers.Adam(**oparams)
 
         # Add Losses
         self.keras_model._losses = []
@@ -3471,10 +3482,10 @@ class MaskRCNN():
 
         # Callbacks
         save_weights = BestAndLatestCheckpoint(save_path=self.config.WEIGHT_DIR, mode='MRCNN')
-        from keras.callbacks import EarlyStopping, ReduceLROnPlateau, TensorBoard
+        from keras.callbacks import EarlyStopping, ReduceLROnPlateau
         early_stop = EarlyStopping(monitor='val_loss', patience=10, verbose=1)
         reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5, verbose=1)
-        tensorboard = TensorBoard(log_dir=os.path.join(self.config.WEIGHT_DIR, 'logs'))
+
 
         # Model compilation
         self.compile()
@@ -3498,12 +3509,13 @@ class MaskRCNN():
             initial_epoch=self.config.FROM_EPOCH,
             epochs=self.config.FROM_EPOCH + self.config.EPOCHS,
             steps_per_epoch=len(train_ids),
-            callbacks=[save_weights, early_stop, reduce_lr, tensorboard],
+            callbacks=[save_weights, early_stop, reduce_lr],
             validation_data=val_generator,
             validation_steps=len(val_ids),
-            max_queue_size=30,
+            max_queue_size=1,
             workers=workers,
             use_multiprocessing=False,
+            verbose=1
         )
 
     def _refine_detections_numpy(self, rpn_rois_batch, mrcnn_class, mrcnn_bbox, image_meta,
@@ -4041,11 +4053,11 @@ def compose_image_meta(image_id, original_image_shape, image_shape,
         where not all classes are present in all datasets.
     """
     meta = np.array(
-        [image_id] +  # size=1
+        [int(image_id)] +  # size=1
         list(original_image_shape) +  # size=4
         list(image_shape) +  # size=4
         list(window) +  # size=6 (y1, x1, z1, y2, x2, z2) in image coordinates
-        [scale] +  # size=1
+        [float(scale)] +  # size=1
         list(active_class_ids)  # size=num_classes
     )
     return meta #18 for num_classes = 2

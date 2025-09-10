@@ -172,12 +172,15 @@ import keras
 from core import utils
  # уже используется ниже в других генераторах
 
+# core/data_generators.py
+
 class HeadGenerator(keras.utils.Sequence):
     """
     Генератор для обучения/валидации HEAD.
     Возвращает ровно то, что ожидают входы модели головы:
-      inputs : [input_rois_aligned, input_mask_aligned, input_image_meta]
-      targets: [input_target_class_ids, input_target_bbox, input_target_mask]
+      inputs : [input_rois_aligned, input_mask_aligned, input_image_meta,
+                input_target_class_ids, input_target_bbox, input_target_mask]
+      targets: []  (лоссы добавлены в граф через add_loss)
     Все тензоры имеют внешнюю батч-ось (B=1).
     """
 
@@ -199,26 +202,32 @@ class HeadGenerator(keras.utils.Sequence):
     @staticmethod
     def _downsample_2x_mean(x):
         """
-        x: [T, H, W, D, C], H=W=D кратны 2
-        вернёт усреднение по 2x2x2 блокам -> [T, H/2, W/2, D/2, C]
+        x: [T, H, W, D, C], H=W=D кратны 2 -> усреднение 2x2x2 -> [T, H/2, W/2, D/2, C]
         """
         T, H, W, D, C = x.shape
         assert H % 2 == 0 and W % 2 == 0 and D % 2 == 0, "Downsample expects even spatial dims"
         x = x.reshape(T, H//2, 2, W//2, 2, D//2, 2, C)
-        return x.mean(axis=(2,4,6))
+        return x.mean(axis=(2, 4, 6))
 
     def __getitem__(self, idx):
-        # берём один image_id (B=1)
+        # один image_id (B=1)
         image_id = int(self.image_ids[idx])
 
-        # dataset должен вернуть: rois_aligned [N, P,P,P, C], mask_aligned [N, M,M,M, C],
+        # dataset обязан вернуть:
+        # rois_aligned [N, P,P,P, C], mask_aligned [N, M,M,M, C],
         # target_class_ids [N], target_bbox [N, 6], target_mask [N, mH,mW,mD]
         rois_aligned, mask_aligned, target_class_ids, target_bbox, target_mask = \
             self.dataset.load_data(image_id)
+
         H, W, D = int(self.config.IMAGE_SHAPE[0]), int(self.config.IMAGE_SHAPE[1]), int(self.config.IMAGE_SHAPE[2])
-        window = (0, 0, 0, H - 1, W - 1, D - 1)
+
+        # ЕСЛИ нужно ровно так же, как в RPN "targeting":
+        # window = (0, 0, 0, *self.config.IMAGE_SHAPE[:-1])  # (y1,x1,z1,y2,x2,z2) без -1
+        window = (0, 0, 0, H, W, D)
+
         active_class_ids = np.ones([self.dataset.num_classes], dtype=np.int32)
-        # image_meta для active_class_ids внутри лоссов
+
+
         image_meta = compose_image_meta(
             image_id=image_id,
             original_image_shape=(H, W, D, 1),
@@ -226,19 +235,22 @@ class HeadGenerator(keras.utils.Sequence):
             window=window,
             scale=1.0,
             active_class_ids=active_class_ids
-        ).astype(np.float32)
+        ).astype(np.float32)  # см. аналогичную сборку мета в твоей RPN "targeting" ветке :contentReference[oaicite:0]{index=0}
 
         # Типы
         rois_aligned = rois_aligned.astype(np.float32, copy=False)
         mask_aligned = mask_aligned.astype(np.float32, copy=False)
         target_class_ids = target_class_ids.astype(np.int32, copy=False)
         target_bbox = target_bbox.astype(np.float32, copy=False)
-        if target_mask.ndim == 4:  # [T, mH, mW, mD] -> [T, mH, mW, mD, 1]
+
+        # target_mask: [T, mH, mW, mD] -> [T, mH, mW, mD, 1]
+        if target_mask.ndim == 4:
             target_mask = target_mask[..., np.newaxis]
         elif target_mask.ndim != 5:
-            raise ValueError(f"[HeadGenerator] target_mask has wrong rank: {target_mask.shape} (need [T,mH,mW,mD,1])")
+            raise ValueError(f"[HeadGenerator] target_mask rank={target_mask.ndim}, need [T,mH,mW,mD,1]")
         target_mask = target_mask.astype(np.float32, copy=False)
-        # Балансировка/чанк на T ROI
+
+        # Балансировка/чанк T ROI
         T = int(getattr(self.config, "TRAIN_ROIS_PER_IMAGE", 128))
         total = int(rois_aligned.shape[0])
         order = np.arange(total, dtype=np.int32)
@@ -252,7 +264,6 @@ class HeadGenerator(keras.utils.Sequence):
             pos_cnt = int(round(T * pos_frac))
             neg_cnt = T - pos_cnt
             if pos_idx.size == 0:
-                # если совсем нет позитивов — берём все bg
                 batch_idx = np.random.choice(neg_idx, size=T, replace=neg_idx.size < T)
             elif neg_idx.size == 0:
                 batch_idx = np.random.choice(pos_idx, size=T, replace=pos_idx.size < T)
@@ -262,14 +273,12 @@ class HeadGenerator(keras.utils.Sequence):
                 batch_idx = np.concatenate([pos_pick, neg_pick])
                 np.random.shuffle(batch_idx)
         else:
-            # eval: равномерно идём чанками
             num_chunks = int(np.ceil(total / float(T))) if T > 0 else 1
             chunk_id = self._call_count % max(1, num_chunks)
             self._call_count += 1
             start, end = int(chunk_id * T), min(int(chunk_id * T) + T, total)
             batch_idx = order[start:end]
             if len(batch_idx) < T:
-                # паддим нулями (редко) — чтобы выйти на ровно T
                 pad = T - len(batch_idx)
                 batch_idx = np.pad(batch_idx, (0, pad), mode='edge')
 
@@ -280,32 +289,31 @@ class HeadGenerator(keras.utils.Sequence):
         target_bbox = target_bbox[batch_idx]
         target_mask = target_mask[batch_idx]
 
-        # Согласуем mask_aligned с конфигом (14→7 или 7→14 не делаем, если уже совпадает)
+        # Приводим mask_aligned к config.MASK_POOL_SIZE (допускается только аккуратный 2x даунсемпл)
         Mconf = int(getattr(self.config, "MASK_POOL_SIZE", 7))
         Mh, Mw, Md = mask_aligned.shape[1:4]
         if (Mh, Mw, Md) != (Mconf, Mconf, Mconf):
             if (Mh, Mw, Md) == (2*Mconf, 2*Mconf, 2*Mconf):
-                # аккуратный 2× даунсемпл по усреднению блоков
                 mask_aligned = self._downsample_2x_mean(mask_aligned)
             else:
-                raise ValueError(f"[HeadGenerator] mask_aligned has shape {Mh}x{Mw}x{Md}, "
-                                 f"but config.MASK_POOL_SIZE={Mconf}. Приведи данные или конфиг к совпадению.")
+                raise ValueError(f"[HeadGenerator] mask_aligned={Mh}x{Mw}x{Md}, but MASK_POOL_SIZE={Mconf}")
 
-        # Оборачиваем ВСЁ в батч-ось
+        # Оборачиваем всё в батч-ось
         x = [
-            np.expand_dims(rois_aligned, 0),  # [1, T, P, P, P, C]
-            np.expand_dims(mask_aligned, 0),  # [1, T, M, M, M, C]
-            np.expand_dims(image_meta, 0),  # [1, META]
-            np.expand_dims(target_class_ids, 0),  # [1, T]
-            np.expand_dims(target_bbox, 0),  # [1, T, 6]
-            np.expand_dims(target_mask, 0),  # [1, T, mH, mW, mD, 1]
+            np.expand_dims(rois_aligned, 0),     # [1, T, P, P, P, C]
+            np.expand_dims(mask_aligned, 0),     # [1, T, M, M, M, C]
+            np.expand_dims(image_meta, 0),       # [1, META]
+            np.expand_dims(target_class_ids, 0), # [1, T]
+            np.expand_dims(target_bbox, 0),      # [1, T, 6]
+            np.expand_dims(target_mask, 0),      # [1, T, mH, mW, mD, 1]
         ]
-        y = []  # лоссы добавлены через add_loss — явные y не нужны
+        y = []  # лоссы через add_loss
         return x, y
 
     def on_epoch_end(self):
         if self.shuffle:
             np.random.shuffle(self.image_ids)
+
 
 
 
