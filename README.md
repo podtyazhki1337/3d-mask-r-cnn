@@ -4,18 +4,19 @@ Also added support for chunked data loading and training for head training and e
 Also contains preprocessing script for the datasets used for my trainings.
 
 Commands for using the Docker image on the datasets (Rats-neurons and Hela Kyoto cells):
-docker run -it --rm --name rpn_train --gpus device=0 -v "$PWD":/workspace -v /NAS/mmaiurov/Datasets:/NAS/mmaiurov/Datasets -w /workspace gdavid57/3d-mask-r-cnn python -W "ignore::UserWarning" -m main --task RPN_TRAINING --config_path configs/rpn/scp_rpn_rats.json --summary
-docker run -it --rm --name rpn_train --gpus device=1 -v "$PWD":/workspace -v /NAS/mmaiurov/Datasets:/NAS/mmaiurov/Datasets -w /workspace gdavid57/3d-mask-r-cnn python -W "ignore::UserWarning" -m main --task RPN_TRAINING --config_path configs/rpn/scp_rpn_hela.json --summary
 
-docker run -it --rm --name target --gpus device=0 -v "$PWD":/workspace -v /NAS/mmaiurov/Datasets:/NAS/mmaiurov/Datasets -w /workspace gdavid57/3d-mask-r-cnn python -W "ignore::UserWarning" -m main --task TARGET_GENERATION --config_path configs/targeting/scp_target_rat.json --summary
-docker run -it --rm --name target --gpus device=1 -v "$PWD":/workspace -v /NAS/mmaiurov/Datasets:/NAS/mmaiurov/Datasets -w /workspace gdavid57/3d-mask-r-cnn python -W "ignore::UserWarning" -m main --task TARGET_GENERATION --config_path configs/targeting/scp_target_hela.json --summary
+    docker run -it --rm --name rpn_train --gpus device=0 -v "$PWD":/workspace -v /NAS/mmaiurov/Datasets:/NAS/mmaiurov/Datasets -w /workspace gdavid57/3d-mask-r-cnn python -W "ignore::UserWarning" -m main --task RPN_TRAINING --config_path configs/rpn/scp_rpn_rats.json --summary
+    docker run -it --rm --name rpn_train --gpus device=1 -v "$PWD":/workspace -v /NAS/mmaiurov/Datasets:/NAS/mmaiurov/Datasets -w /workspace gdavid57/3d-mask-r-cnn python -W "ignore::UserWarning" -m main --task RPN_TRAINING --config_path configs/rpn/scp_rpn_hela.json --summary
+
+    docker run -it --rm --name target --gpus device=0 -v "$PWD":/workspace -v /NAS/mmaiurov/Datasets:/NAS/mmaiurov/Datasets -w /workspace gdavid57/3d-mask-r-cnn python -W "ignore::UserWarning" -m main --task TARGET_GENERATION --config_path configs/targeting/scp_target_rat.json --summary
+    docker run -it --rm --name target --gpus device=1 -v "$PWD":/workspace -v /NAS/mmaiurov/Datasets:/NAS/mmaiurov/Datasets -w /workspace gdavid57/3d-mask-r-cnn python -W "ignore::UserWarning" -m main --task TARGET_GENERATION --config_path configs/targeting/scp_target_hela.json --summary
 
 
-docker run -it --rm --name head_train --gpus device=0 -v "$PWD":/workspace -v /NAS/mmaiurov/Datasets:/NAS/mmaiurov/Datasets -w /workspace gdavid57/3d-mask-r-cnn python -W "ignore::UserWarning" -m main --task HEAD_TRAINING --config_path configs/heads/scp_heads_rats.json --summary
-docker run -it --rm --name head_train --gpus device=1 -v "$PWD":/workspace -v /NAS/mmaiurov/Datasets:/NAS/mmaiurov/Datasets -w /workspace gdavid57/3d-mask-r-cnn python -W "ignore::UserWarning" -m main --task HEAD_TRAINING --config_path configs/heads/scp_heads_hela.json --summary
+    docker run -it --rm --name head_train --gpus device=0 -v "$PWD":/workspace -v /NAS/mmaiurov/Datasets:/NAS/mmaiurov/Datasets -w /workspace gdavid57/3d-mask-r-cnn python -W "ignore::UserWarning" -m main --task HEAD_TRAINING --config_path configs/heads/scp_heads_rats.json --summary
+    docker run -it --rm --name head_train --gpus device=1 -v "$PWD":/workspace -v /NAS/mmaiurov/Datasets:/NAS/mmaiurov/Datasets -w /workspace gdavid57/3d-mask-r-cnn python -W "ignore::UserWarning" -m main --task HEAD_TRAINING --config_path configs/heads/scp_heads_hela.json --summary
 
-docker run -it --rm --name mrcnn_eval --gpus device=1 -v "$PWD":/workspace -v /NAS/mmaiurov/Datasets:/NAS/mmaiurov/Datasets -w /workspace gdavid57/3d-mask-r-cnn python -W "ignore::UserWarning" -m main --task MRCNN_EVALUATION --config_path configs/mrcnn/scp_mrcnn_rats.json --summary
-docker run -it --rm --name mrcnn_eval --gpus device=1 -v "$PWD":/workspace -v /NAS/mmaiurov/Datasets:/NAS/mmaiurov/Datasets -w /workspace gdavid57/3d-mask-r-cnn python -W "ignore::UserWarning" -m main --task MRCNN_EVALUATION --config_path configs/mrcnn/scp_mrcnn_hela.json --summary
+    docker run -it --rm --name mrcnn_eval --gpus device=1 -v "$PWD":/workspace -v /NAS/mmaiurov/Datasets:/NAS/mmaiurov/Datasets -w /workspace gdavid57/3d-mask-r-cnn python -W "ignore::UserWarning" -m main --task MRCNN_EVALUATION --config_path configs/mrcnn/scp_mrcnn_rats.json --summary
+    docker run -it --rm --name mrcnn_eval --gpus device=1 -v "$PWD":/workspace -v /NAS/mmaiurov/Datasets:/NAS/mmaiurov/Datasets -w /workspace gdavid57/3d-mask-r-cnn python -W "ignore::UserWarning" -m main --task MRCNN_EVALUATION --config_path configs/mrcnn/scp_mrcnn_hela.json --summary
 
 
 Based on the [2D implementation](https://github.com/matterport/Mask_RCNN) by Matterport, Inc, [this update](https://github.com/ahmedfgad/Mask-RCNN-TF2) and [this fork](https://github.com/matterport/Mask_RCNN/pull/1611/files).
