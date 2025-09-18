@@ -18,7 +18,7 @@
     "POST_NMS_ROIS_TRAINING": 4000,
     "POST_NMS_ROIS_INFERENCE": 3500,
 
-    "TRAIN_ROIS_PER_IMAGE": 128,
+    "TRAIN_ROIS_PER_IMAGE": 512,
     "ROI_POSITIVE_RATIO": 0.5,
     "FPN_CLASSIF_FC_LAYERS_SIZE": 512,
     "DETECTION_MAX_INSTANCES": 40,
@@ -34,7 +34,7 @@
     "EPOCHS": 20, 
     "FROM_EPOCH": 0,
     "RPN_WEIGHTS": "weights/scp_rpn_rats/EPOCH_006.h5",
-    "HEAD_WEIGHTS": "weights/scp_heads_rats/best.h5",
+    "HEAD_WEIGHTS": "weights/scp_heads_rats/latest.h5",
 
     "BACKBONE_STRIDES": [[4,4,2],[8,8,2],[16,16,2],[32,32,2],[64,64,2]],
     "RPN_ANCHOR_SCALES": [48, 56, 64, 80, 120],

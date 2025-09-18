@@ -184,50 +184,204 @@ class HeadGenerator(keras.utils.Sequence):
     Все тензоры имеют внешнюю батч-ось (B=1).
     """
 
-    def __init__(self, dataset, config, shuffle=True, training=True):
-        self.image_ids = np.copy(dataset.image_ids)
+    def __init__(self, dataset, config, shuffle=True, training=True, batch_size=1):
+        # базовые поля
         self.dataset = dataset
         self.config = config
-        self.shuffle = shuffle
-        self.training = training
-        self.batch_size = int(getattr(self.config, "BATCH_SIZE", 1))
-        assert self.batch_size == 1, "HeadGenerator рассчитан на BATCH_SIZE==1 для предсказуемого VRAM"
-        self._call_count = 0
+        self.shuffle = bool(shuffle)
+        self.training = bool(training)
+        self.batch_size = int(batch_size) if batch_size is not None else 1  # здесь ожидается B=1
+
+        # список id изображений
+        self.image_ids = np.copy(self.dataset.image_ids).astype(np.int64)
+        self._call_count = 0  # для чанкинга по ROI при режиме без балансировки
+
         if self.shuffle:
             np.random.shuffle(self.image_ids)
 
     def __len__(self):
+        # количество батчей на эпоху (по одному image_id на батч)
         return int(np.ceil(len(self.image_ids) / float(self.batch_size)))
+
+    def on_epoch_end(self):
+        if self.shuffle:
+            np.random.shuffle(self.image_ids)
 
     @staticmethod
     def _downsample_2x_mean(x):
         """
-        x: [T, H, W, D, C], H=W=D кратны 2 -> усреднение 2x2x2 -> [T, H/2, W/2, D/2, C]
+        x: [N, H, W, D, C] -> усреднение блоков 2x2x2 -> [N, H/2, W/2, D/2, C]
+        Требует чётные H, W, D.
         """
-        T, H, W, D, C = x.shape
+        N, H, W, D, C = x.shape
         assert H % 2 == 0 and W % 2 == 0 and D % 2 == 0, "Downsample expects even spatial dims"
-        x = x.reshape(T, H//2, 2, W//2, 2, D//2, 2, C)
+        x = x.reshape(N, H // 2, 2, W // 2, 2, D // 2, 2, C)
         return x.mean(axis=(2, 4, 6))
 
+    def load_image_gt(self, image_id):
+        """
+        Возвращает РОВНО 5 массивов для головы (без image_meta):
+          rois_aligned, mask_aligned, target_class_ids, target_bbox, target_mask
+        Ничего не форсит и не балансирует.
+        """
+        import numpy as np
+        # Dataset обязан реализовывать .load_data(image_id) и возвращать 5 массивов.
+        rois_aligned, mask_aligned, target_class_ids, target_bbox, target_mask = self.dataset.load_data(image_id)
+
+        # типы/формы приводим здесь, но БЕЗ image_meta
+        rois_aligned = rois_aligned.astype(np.float32, copy=False)
+        mask_aligned = mask_aligned.astype(np.float32, copy=False)
+        target_class_ids = target_class_ids.astype(np.int32, copy=False)
+        target_bbox = target_bbox.astype(np.float32, copy=False)
+
+        # target_mask ожидаем [T,mH,mW,mD] или [T,mH,mW,mD,1] -> сделаем [T,mH,mW,mD,1] и {0,1}
+        if target_mask.ndim == 4:
+            target_mask = target_mask[..., np.newaxis]
+        elif target_mask.ndim != 5:
+            raise ValueError(f"[HeadGenerator.load_image_gt] target_mask rank={target_mask.ndim}, need 4 or 5")
+        target_mask = (target_mask > 0.5).astype(np.float32, copy=False)
+
+        return rois_aligned, mask_aligned, target_class_ids, target_bbox, target_mask
+
     def __getitem__(self, idx):
-        # один image_id (B=1)
+        """
+        Батч для головы с правильными размерностями всех тензоров.
+        """
+        import numpy as np
+
         image_id = int(self.image_ids[idx])
 
-        # dataset обязан вернуть:
-        # rois_aligned [N, P,P,P, C], mask_aligned [N, M,M,M, C],
-        # target_class_ids [N], target_bbox [N, 6], target_mask [N, mH,mW,mD]
-        rois_aligned, mask_aligned, target_class_ids, target_bbox, target_mask = \
-            self.dataset.load_data(image_id)
+        # 1) Загружаем данные (уже с правильными размерностями после исправления ToyHeadDataset)
+        rois_aligned, mask_aligned, target_class_ids, target_bbox, target_mask = self.dataset.load_data(image_id)
 
-        H, W, D = int(self.config.IMAGE_SHAPE[0]), int(self.config.IMAGE_SHAPE[1]), int(self.config.IMAGE_SHAPE[2])
+        # 2) Конфиг/параметры
+        cfg = self.config
+        T = int(getattr(cfg, "TRAIN_ROIS_PER_IMAGE", 128))
+        M_feat_mask = int(getattr(cfg, "MASK_POOL_SIZE", 14))
 
-        # ЕСЛИ нужно ровно так же, как в RPN "targeting":
-        # window = (0, 0, 0, *self.config.IMAGE_SHAPE[:-1])  # (y1,x1,z1,y2,x2,z2) без -1
+        # Размер таргет-маски из MASK_SHAPE
+        assert hasattr(cfg, "MASK_SHAPE") and len(cfg.MASK_SHAPE) == 3
+        M_tgt_mask = int(cfg.MASK_SHAPE[0])
+        assert tuple(cfg.MASK_SHAPE) == (M_tgt_mask, M_tgt_mask, M_tgt_mask)
+
+        H, W, D = int(cfg.IMAGE_SHAPE[0]), int(cfg.IMAGE_SHAPE[1]), int(cfg.IMAGE_SHAPE[2])
+        num_classes = int(getattr(self.dataset, "num_classes", getattr(cfg, "NUM_CLASSES", 2)))
+
+        # 3) Типы
+        rois_aligned = rois_aligned.astype(np.float32, copy=False)
+        mask_aligned = mask_aligned.astype(np.float32, copy=False)
+        target_class_ids = target_class_ids.astype(np.int32, copy=False)  # ОБЯЗАТЕЛЬНО int32
+        target_bbox = target_bbox.astype(np.float32, copy=False)
+        target_mask = target_mask.astype(np.float32, copy=False)
+
+        # target_mask уже должен быть [T, mH, mW, mD, 1]
+        if target_mask.ndim == 4:
+            target_mask = target_mask[..., np.newaxis]
+        target_mask = (target_mask > 0.5).astype(np.float32, copy=False)
+
+        # 4) Ресайз функция (улучшенная)
+        def _resize_spatial(x, M):
+            """x: [N,Mh,Mw,Md,C] -> [N,M,M,M,C] или [N,Mh,Mw,Md] -> [N,M,M,M]"""
+            if x is None:
+                return None
+
+            if x.ndim == 4:  # [N,Mh,Mw,Md]
+                N, Mh, Mw, Md = x.shape
+                has_ch = False
+            elif x.ndim == 5:  # [N,Mh,Mw,Md,C]
+                N, Mh, Mw, Md, C = x.shape
+                has_ch = True
+            else:
+                raise ValueError(f"Unexpected x.ndim={x.ndim}")
+
+            if (Mh, Mw, Md) == (M, M, M):
+                return x.astype(np.float32, copy=False)
+
+            # Простая стратегия ресайза - равномерная дискретизация
+            ih = np.linspace(0, Mh - 1, M).astype(np.int64)
+            iw = np.linspace(0, Mw - 1, M).astype(np.int64)
+            iz = np.linspace(0, Md - 1, M).astype(np.int64)
+
+            if has_ch:
+                out = x[:, ih][:, :, iw][:, :, :, iz]  # [N,M,M,M,C]
+            else:
+                out = x[:, ih][:, :, iw][:, :, :, iz]  # [N,M,M,M]
+
+            return out.astype(np.float32, copy=False)
+
+        # 5) Ресайз масок
+        # mask_aligned: должен остаться [T, MASK_POOL_SIZE, MASK_POOL_SIZE, MASK_POOL_SIZE, C]
+        if mask_aligned.ndim == 5:
+            # Ресайзим пространственные размеры, сохраняя канальную ось
+            mask_aligned = _resize_spatial(mask_aligned, M_feat_mask)
+        else:
+            # Если вдруг получили 4D, добавляем канальную ось
+            mask_aligned = _resize_spatial(mask_aligned, M_feat_mask)
+            if mask_aligned.ndim == 4:
+                mask_aligned = mask_aligned[..., np.newaxis]
+
+        # target_mask: [T, *MASK_SHAPE, 1]
+        if target_mask.ndim == 5:
+            # Убираем канальную ось для ресайза, потом возвращаем
+            tm_no_ch = target_mask[..., 0]  # [T, m, m, m]
+            tm_resized = _resize_spatial(tm_no_ch, M_tgt_mask)  # [T, M_tgt, M_tgt, M_tgt]
+            target_mask = tm_resized[..., np.newaxis]  # [T, M_tgt, M_tgt, M_tgt, 1]
+
+        # 6) Выборка ROI и паддинг
+        total = int(rois_aligned.shape[0])
+        order = np.arange(total, dtype=np.int32)
+        if self.training and bool(getattr(cfg, "HEAD_SHUFFLE_ROIS", True)) and total > 0:
+            np.random.shuffle(order)
+
+        if total <= T:
+            sel = order
+        else:
+            if self.training and bool(getattr(cfg, "HEAD_BALANCE_POS", True)):
+                pos_idx = order[target_class_ids[order] > 0]
+                neg_idx = order[target_class_ids[order] <= 0]
+                pos_frac = float(getattr(cfg, "HEAD_POS_FRAC", 0.33))
+                pos_cnt = int(round(T * pos_frac))
+                neg_cnt = T - pos_cnt
+                if pos_idx.size == 0:
+                    sel = np.random.choice(neg_idx, size=T, replace=neg_idx.size < T)
+                elif neg_idx.size == 0:
+                    sel = np.random.choice(pos_idx, size=T, replace=pos_idx.size < T)
+                else:
+                    sel = np.concatenate([
+                        np.random.choice(pos_idx, size=pos_cnt, replace=pos_idx.size < pos_cnt),
+                        np.random.choice(neg_idx, size=neg_cnt, replace=neg_idx.size < neg_cnt)
+                    ])
+                    np.random.shuffle(sel)
+            else:
+                sel = np.random.choice(order, size=T, replace=False)
+
+        def _take_or_pad(a, pad_val=0):
+            if a is None:
+                return None
+            out = a[sel] if sel.size else a[:0]
+            if out.shape[0] < T:
+                pad = T - out.shape[0]
+                pad_shape = (pad,) + out.shape[1:]
+                out = np.concatenate([out, np.full(pad_shape, pad_val, dtype=out.dtype)], axis=0)
+            return out
+
+        rois_aligned = _take_or_pad(rois_aligned, pad_val=0)
+        mask_aligned = _take_or_pad(mask_aligned, pad_val=0)
+        target_class_ids = _take_or_pad(target_class_ids, pad_val=0).astype(np.int32, copy=False)
+        target_bbox = _take_or_pad(target_bbox, pad_val=0)
+        target_mask = _take_or_pad(target_mask, pad_val=0)
+
+        # # 7) Финальные проверки форм
+        # print(f"[DEBUG] HeadGenerator batch shapes:")
+        # print(f"  rois_aligned: {rois_aligned.shape}")
+        # print(f"  mask_aligned: {mask_aligned.shape}")
+        # print(f"  target_class_ids: {target_class_ids.shape}")
+        # print(f"  target_bbox: {target_bbox.shape}")
+        # print(f"  target_mask: {target_mask.shape}")
+
+        # 8) image_meta
         window = (0, 0, 0, H, W, D)
-
-        active_class_ids = np.ones([self.dataset.num_classes], dtype=np.int32)
-
-
+        active_class_ids = np.ones([num_classes], dtype=np.int32)
         image_meta = compose_image_meta(
             image_id=image_id,
             original_image_shape=(H, W, D, 1),
@@ -235,89 +389,19 @@ class HeadGenerator(keras.utils.Sequence):
             window=window,
             scale=1.0,
             active_class_ids=active_class_ids
-        ).astype(np.float32)  # см. аналогичную сборку мета в твоей RPN "targeting" ветке :contentReference[oaicite:0]{index=0}
+        ).astype(np.float32)
 
-        # Типы
-        rois_aligned = rois_aligned.astype(np.float32, copy=False)
-        mask_aligned = mask_aligned.astype(np.float32, copy=False)
-        target_class_ids = target_class_ids.astype(np.int32, copy=False)
-        target_bbox = target_bbox.astype(np.float32, copy=False)
-
-        # target_mask: [T, mH, mW, mD] -> [T, mH, mW, mD, 1]
-        if target_mask.ndim == 4:
-            target_mask = target_mask[..., np.newaxis]
-        elif target_mask.ndim != 5:
-            raise ValueError(f"[HeadGenerator] target_mask rank={target_mask.ndim}, need [T,mH,mW,mD,1]")
-        target_mask = target_mask.astype(np.float32, copy=False)
-
-        # Балансировка/чанк T ROI
-        T = int(getattr(self.config, "TRAIN_ROIS_PER_IMAGE", 128))
-        total = int(rois_aligned.shape[0])
-        order = np.arange(total, dtype=np.int32)
-        if self.training and bool(getattr(self.config, "HEAD_SHUFFLE_ROIS", True)):
-            np.random.shuffle(order)
-        pos_idx = order[target_class_ids[order] > 0]
-        neg_idx = order[target_class_ids[order] <= 0]
-
-        if self.training and bool(getattr(self.config, "HEAD_BALANCE_POS", True)):
-            pos_frac = float(getattr(self.config, "HEAD_POS_FRAC", 0.33))
-            pos_cnt = int(round(T * pos_frac))
-            neg_cnt = T - pos_cnt
-            if pos_idx.size == 0:
-                batch_idx = np.random.choice(neg_idx, size=T, replace=neg_idx.size < T)
-            elif neg_idx.size == 0:
-                batch_idx = np.random.choice(pos_idx, size=T, replace=pos_idx.size < T)
-            else:
-                pos_pick = np.random.choice(pos_idx, size=pos_cnt, replace=pos_idx.size < pos_cnt)
-                neg_pick = np.random.choice(neg_idx, size=neg_cnt, replace=neg_idx.size < neg_cnt)
-                batch_idx = np.concatenate([pos_pick, neg_pick])
-                np.random.shuffle(batch_idx)
-        else:
-            num_chunks = int(np.ceil(total / float(T))) if T > 0 else 1
-            chunk_id = self._call_count % max(1, num_chunks)
-            self._call_count += 1
-            start, end = int(chunk_id * T), min(int(chunk_id * T) + T, total)
-            batch_idx = order[start:end]
-            if len(batch_idx) < T:
-                pad = T - len(batch_idx)
-                batch_idx = np.pad(batch_idx, (0, pad), mode='edge')
-
-        # Собираем батч ROI
-        rois_aligned = rois_aligned[batch_idx]
-        mask_aligned = mask_aligned[batch_idx]
-        target_class_ids = target_class_ids[batch_idx]
-        target_bbox = target_bbox[batch_idx]
-        target_mask = target_mask[batch_idx]
-
-        # Приводим mask_aligned к config.MASK_POOL_SIZE (допускается только аккуратный 2x даунсемпл)
-        Mconf = int(getattr(self.config, "MASK_POOL_SIZE", 7))
-        Mh, Mw, Md = mask_aligned.shape[1:4]
-        if (Mh, Mw, Md) != (Mconf, Mconf, Mconf):
-            if (Mh, Mw, Md) == (2*Mconf, 2*Mconf, 2*Mconf):
-                mask_aligned = self._downsample_2x_mean(mask_aligned)
-            else:
-                raise ValueError(f"[HeadGenerator] mask_aligned={Mh}x{Mw}x{Md}, but MASK_POOL_SIZE={Mconf}")
-
-        # Оборачиваем всё в батч-ось
+        # 9) Батчевые оси (B=1)
         x = [
-            np.expand_dims(rois_aligned, 0),     # [1, T, P, P, P, C]
-            np.expand_dims(mask_aligned, 0),     # [1, T, M, M, M, C]
-            np.expand_dims(image_meta, 0),       # [1, META]
-            np.expand_dims(target_class_ids, 0), # [1, T]
-            np.expand_dims(target_bbox, 0),      # [1, T, 6]
-            np.expand_dims(target_mask, 0),      # [1, T, mH, mW, mD, 1]
+            np.expand_dims(rois_aligned, 0).astype(np.float32),
+            np.expand_dims(mask_aligned, 0).astype(np.float32),
+            np.expand_dims(image_meta, 0).astype(np.float32),
+            np.expand_dims(target_class_ids, 0).astype(np.int32),  # ВАЖНО!
+            np.expand_dims(target_bbox, 0).astype(np.float32),
+            np.expand_dims(target_mask, 0).astype(np.float32),
         ]
-        y = []  # лоссы через add_loss
+        y = []
         return x, y
-
-    def on_epoch_end(self):
-        if self.shuffle:
-            np.random.shuffle(self.image_ids)
-
-
-
-
-
 
 
 class RPNGenerator(keras.utils.Sequence):
@@ -591,73 +675,98 @@ class MrcnnGenerator(keras.utils.Sequence):
     def get_input_prediction(self, image_id):
         """
         Готовит входы для инференса ТОЧНО как в тренировке:
-          - изображение через dataset.load_image(image_id) (у вас там уже шкалирование в [-1, 1])
-          - active_class_ids как в __getitem__: включены классы текущего source
+          - изображение через dataset.load_image(image_id)
+          - active_class_ids безопасно приводим к длине config.NUM_CLASSES (fallback если mapping пуст)
           - корректная image_meta через compose_image_meta(...)
-          - anchors: нормированные self.anchors
+          - anchors
         Возвращает:
-          name  : базовое имя файла (без пути и расширения)
-          inputs: [images, image_meta, anchors] с батч-измерением
+          name, inputs: [images, image_meta, anchors]
         """
         import numpy as np
 
         info = self.dataset.image_info[image_id]
-        image = self.dataset.load_image(image_id).astype(np.float32)  # (H, W, D, 1) — как в train
+        image = self.dataset.load_image(image_id).astype(np.float32)
         name = info["path"].split("/")[-1].rsplit(".", 1)[0]
+        if bool(getattr(self.config, "INFERENCE_MATCH_TRAIN_NORMALIZATION", False)):
+            mu = float(image.mean());
+            sd = float(image.std())
+            if sd > 0.0:
+                image = (image - mu) / sd
+        # robust active_class_ids
+        num = int(getattr(self.config, "NUM_CLASSES", getattr(self.dataset, "num_classes", 1)))
+        active_class_ids = np.zeros([num], dtype=np.int32)
+        try:
+            src_ids = list(self.dataset.source_class_ids.get(info["source"], []))
+            src_ids = [int(i) for i in src_ids if 0 <= int(i) < num]
+            if src_ids:
+                active_class_ids[src_ids] = 1
+            else:
+                if num > 1:
+                    active_class_ids[1:] = 1
+        except Exception:
+            if num > 1:
+                active_class_ids[1:] = 1
 
-        # active_class_ids — как в __getitem__
-        active_class_ids = np.zeros([self.dataset.num_classes], dtype=np.int32)
-        source_class_ids = self.dataset.source_class_ids[info["source"]]
-        active_class_ids[source_class_ids] = 1
+        # ВАЖНО: фон всегда активен (BG=1), иначе лосс/логика класса 0 деградирует
+        if active_class_ids.shape[0] > 0:
+            active_class_ids[0] = 1
 
-        # meta: original=image_shape=CONFIG.IMAGE_SHAPE, окно — вся картинка, scale=1.0
         image_meta = compose_image_meta(
             image_id=image_id,
             original_image_shape=tuple(self.config.IMAGE_SHAPE),
             image_shape=tuple(self.config.IMAGE_SHAPE),
-            window=(0, 0, 0, *self.config.IMAGE_SHAPE[:-1]),  # (y1,x1,z1,y2,x2,z2)
+            window=(0, 0, 0, *self.config.IMAGE_SHAPE[:-1]),
             scale=1.0,
             active_class_ids=active_class_ids
         ).astype(np.float32)
 
-        # батч=1
-        batch_images = np.zeros((1,) + image.shape, dtype=np.float32)
+        batch_images = np.zeros((1,) + image.shape, dtype=np.float32);
         batch_images[0] = image
-        batch_meta = np.zeros((1,) + image_meta.shape, dtype=np.float32)
+        batch_meta = np.zeros((1,) + image_meta.shape, dtype=np.float32);
         batch_meta[0] = image_meta
         batch_anchors = self.anchors[np.newaxis].astype(np.float32)
+
+        try:
+            act_idx = np.nonzero(active_class_ids)[0]
+            print(f"[DEBUG] active_class_ids: total_active={int(active_class_ids.sum())}, sample={act_idx[:8]}")
+        except Exception:
+            pass
 
         return name, [batch_images, batch_meta, batch_anchors]
 
     def load_image_gt(self, image_id):
-        """Load image and ground truth data with consistent processing."""
-        # Load image with proper preprocessing
+        """Load image and (если training) GT, с корректным active_class_ids под NUM_CLASSES."""
+        import numpy as np
+
+        # Load image
         image = self.dataset.load_image(image_id)
 
-        # In inference mode, we only need image and meta
-        if not self.training:
-            active_class_ids = np.zeros([self.dataset.num_classes], dtype=np.int32)
-            source_class_ids = self.dataset.source_class_ids[self.dataset.image_info[image_id]["source"]]
-            active_class_ids[source_class_ids] = 1
-            image_meta = compose_image_meta(
-                image_id,
-                tuple(self.config.IMAGE_SHAPE),
-                tuple(self.config.IMAGE_SHAPE),
-                (0, 0, 0, *self.config.IMAGE_SHAPE[:-1]),  # Full image window
-                1.0,  # Scale = 1.0
-                active_class_ids
-            )
+        # Собираем meta и active_class_ids одинаково для train/infer
+        num = int(getattr(self.config, "NUM_CLASSES", getattr(self.dataset, "num_classes", 1)))
+        active_class_ids = np.zeros([num], dtype=np.int32)
+        try:
+            src = self.dataset.image_info[image_id]["source"]
+            src_ids = list(self.dataset.source_class_ids.get(src, []))
+            src_ids = [int(i) for i in src_ids if 0 <= int(i) < num]
+            if src_ids:
+                active_class_ids[src_ids] = 1
+            else:
+                if num > 1:
+                    active_class_ids[1:] = 1
+        except Exception:
+            if num > 1:
+                active_class_ids[1:] = 1
 
-            # Also load GT data for metrics calculation during evaluation
-            try:
-                boxes, class_ids, masks = self.dataset.load_data(image_id)
-                return image, image_meta, boxes, class_ids, masks
-            except:
-                return image, image_meta
+        image_meta = compose_image_meta(
+            image_id, tuple(self.config.IMAGE_SHAPE), tuple(self.config.IMAGE_SHAPE),
+            (0, 0, 0, *self.config.IMAGE_SHAPE[:-1]), 1.0, active_class_ids
+        )
 
-        # For training, load all GT data
-        boxes, class_ids, masks = self.dataset.load_data(image_id)
-        return image, image_meta, boxes, class_ids, masks
+        if self.training:
+            boxes, class_ids, masks = self.dataset.load_data(image_id)
+            return image, image_meta, boxes, class_ids, masks
+        else:
+            return image, image_meta
 
 
 def compose_image_meta(image_id, original_image_shape, image_shape,
@@ -871,187 +980,327 @@ class Dataset(object):
 
 
 class ToyDataset(Dataset):
+    """Улучшенный датасет для нейронных данных с лучшей предобработкой."""
 
     def load_dataset(self, data_dir, is_train=True):
-        """
-        Универсальный лоадер:
-        - поддерживает названия колонок: images|image|img|path|image_path,
-                                         segs|seg|seg_path|labels|label_path,
-                                         cabs|cab|boxes|cab_path,
-                                         masks|mask|masks_path|mask_path
-        - автоматически определяет разделитель CSV (',' или ';')
-        - печатает, какие колонки реально использованы
-        """
-        import pandas as pd
-        import numpy as np
-        import os
-
-        # объявим классы как в исходнике (оставляю как было)
-        cfg = getattr(self, "config", None)
-        if cfg and hasattr(cfg, "CLASS_NAMES"):
-            class_names = list(cfg.CLASS_NAMES)  # напр. ["neuron"] или ["rat_cell"]
-        elif cfg and hasattr(cfg, "NUM_CLASSES") and int(cfg.NUM_CLASSES) == 2:
-            class_names = ["neuron"]  # один foreground (+ BG)
-        else:
-            class_names = ["ellipsoid", "cuboid", "pyramid"]  # бэкап как в исходнике
-
-        for i, name in enumerate(class_names, start=1):
-            self.add_class("dataset", i, name)
+        import os, pandas as pd
+        self.add_class("dataset", 1, "neuron")
 
         split = "train" if is_train else "test"
         csv_path = os.path.join(data_dir, "datasets", f"{split}.csv")
+        td = pd.read_csv(csv_path, sep=None, engine="python")
 
-        # читаем CSV с авто-определением разделителя
-        try:
-            td = pd.read_csv(csv_path, sep=None, engine="python")
-        except Exception as e:
-            raise RuntimeError(f"[load_dataset] failed to read CSV: {csv_path} ({type(e).__name__}: {e})")
+        cols = {c.lower(): c for c in td.columns}
 
-        cols = {c.lower(): c for c in td.columns}  # lower->original
-
-        def pick(*candidates, required=True):
-            """берём первую существующую колонку из списка кандидатов (по lowercase-совпадению)"""
-            for cand in candidates:
-                key = cand.lower()
-                if key in cols:
-                    return cols[key]
-                # мягкий поиск по подстроке
+        def pick(*cands, required=True):
+            for c in cands:
+                k = c.lower()
+                if k in cols: return cols[k]
                 for lc, orig in cols.items():
-                    if key in lc:
-                        return orig
+                    if k in lc: return orig
             if required:
-                raise KeyError(f"[load_dataset] none of columns {candidates} found in CSV. "
-                               f"Available: {list(td.columns)}")
+                raise KeyError(f"[Dataset.load_dataset] none of columns {cands} found. Available: {list(td.columns)}")
             return None
 
-        # подбираем реальные имена колонок
         col_images = pick("images", "image", "img", "path", "image_path")
-        col_segs   = pick("segs", "seg", "seg_path", "labels", "label_path", required=False)
-        col_cabs   = pick("cabs", "cab", "boxes", "cab_path")
-        col_masks  = pick("masks", "mask", "masks_path", "mask_path")
+        col_segs = pick("segs", "seg", "seg_path", "labels", "label_path", required=False)
+        col_cabs = pick("cabs", "cab", "boxes", "cab_path")
+        col_masks = pick("masks", "mask", "masks_path", "mask_path")
 
         print(f"[Dataset] Using columns -> images:'{col_images}', segs:'{col_segs}', "
-              f"cabs:'{col_cabs}', masks:'{col_masks}'")
+              f"cabs:'{col_cabs}', masks:'{col_masks}'", flush=True)
 
-        # добавляем изображения
-        n = len(td)
-        for i in range(n):
+        for i in range(len(td)):
             img_path = td.at[i, col_images]
-            seg_path = td.at[i, col_segs]  if col_segs  is not None else None
+            seg_path = td.at[i, col_segs] if col_segs is not None else None
             cab_path = td.at[i, col_cabs]
-            m_path   = td.at[i, col_masks]
+            m_path = td.at[i, col_masks]
+            if not isinstance(img_path, str): raise ValueError(f"[load_dataset] bad 'images' at row {i}")
+            if not isinstance(cab_path, str): raise ValueError(f"[load_dataset] bad 'cabs' at row {i}")
+            if not isinstance(m_path, str):   raise ValueError(f"[load_dataset] bad 'masks' at row {i}")
+            self.add_image('dataset', image_id=i, path=img_path, seg_path=seg_path, cab_path=cab_path, m_path=m_path)
 
-            if not isinstance(img_path, str):
-                raise ValueError(f"[load_dataset] bad 'images' value at row {i}: {img_path}")
-            if not isinstance(cab_path, str):
-                raise ValueError(f"[load_dataset] bad 'cabs' value at row {i}: {cab_path}")
-            if not isinstance(m_path, str):
-                raise ValueError(f"[load_dataset] bad 'masks' value at row {i}: {m_path}")
-
-            self.add_image(
-                'dataset',
-                image_id=i,
-                path=img_path,
-                seg_path=seg_path,
-                cab_path=cab_path,
-                m_path=m_path
-            )
-
-        print('Training dataset is loaded.' if is_train else 'Validation dataset is loaded.')
+        print('Training dataset is loaded.' if is_train else 'Validation dataset is loaded.', flush=True)
 
     def load_image(self, image_id, z_slice=None):
-        """Load the specified image and return a [H,W,3] Numpy array.
         """
-        # Load image
+        Улучшенная загрузка для нейронных данных с z-score нормализацией.
+        Возвращает [H, W, D, 1] float32.
+        """
         info = self.image_info[image_id]
-        image = imread(info["path"])
-        image = np.transpose(image, (1, 2, 0))
-        image = 2 * (image / 255) - 1
-        image = image[..., np.newaxis]
-        # print(image.shape)
-        return image
+        image = imread(info["path"])  # ожидается (Z, Y, X)
+        image = np.transpose(image, (1, 2, 0))  # -> (Y, X, Z)
 
+        # Z-score нормализация лучше для нейронных данных
+        image = image.astype(np.float32)
+
+        # Убираем выбросы (улучшает контраст нейронов)
+        p1, p99 = np.percentile(image, [1, 99])
+        image = np.clip(image, p1, p99)
+
+        # Z-score нормализация
+        mean_val = np.mean(image)
+        std_val = np.std(image)
+        if std_val > 0:
+            image = (image - mean_val) / std_val
+        else:
+            image = image - mean_val
+
+        # Дополнительное масштабирование для стабильности
+        image = np.tanh(image * 0.5)  # мягкое ограничение [-1, 1]
+
+        return image[..., np.newaxis].astype(np.float32, copy=False)
 
     def load_data(self, image_id, masks_needed=True):
+        """
+        Улучшенная загрузка данных с валидацией боксов для нейронов.
+        """
+        import bz2, _pickle as cPickle, numpy as np
         info = self.image_info[image_id]
+
+        # Загрузка и валидация боксов
         cabs = np.loadtxt(info["cab_path"], ndmin=2, dtype=np.int32)
         if cabs.size:
             if cabs.ndim == 1:
                 cabs = cabs.reshape((1, -1))
-            # z y x z y x  →  y x z y x z
-            boxes = cabs[:, [2, 3, 1, 5, 6, 4]]
+            boxes = cabs[:, [2, 3, 1, 5, 6, 4]]  # (z,y,x,z,y,x) -> (y1,x1,z1,y2,x2,z2)
             class_ids = cabs[:, 0]
+
+            # Валидация боксов для нейронных структур
+            valid_mask = (
+                    (boxes[:, 3] > boxes[:, 0]) &  # y2 > y1
+                    (boxes[:, 4] > boxes[:, 1]) &  # x2 > x1
+                    (boxes[:, 5] > boxes[:, 2]) &  # z2 > z1
+                    (boxes[:, 0] >= 0) &  # y1 >= 0
+                    (boxes[:, 1] >= 0) &  # x1 >= 0
+                    (boxes[:, 2] >= 0)  # z1 >= 0
+            )
+
+            if not np.all(valid_mask):
+                print(f"[Dataset][{image_id}] Warning: {np.sum(~valid_mask)} invalid boxes removed")
+                boxes = boxes[valid_mask]
+                class_ids = class_ids[valid_mask]
         else:
             boxes = np.zeros((0, 6), dtype=np.int32)
             class_ids = np.zeros((0,), dtype=np.int32)
 
-            # --- маски --------------------------------------------
-        if masks_needed:
-            if boxes.shape[0] == 0:
-                img = imread(info["path"])
-                H, W, D = img.shape[1], img.shape[2], img.shape[0]  # (Z,Y,X)→(Y,X,Z)
-                masks = np.zeros((H, W, D, 0), dtype=bool)
-            else:
+        if not masks_needed:
+            return boxes, class_ids, None
+
+        if boxes.shape[0] == 0:
+            img = imread(info["path"])
+            H, W, D = img.shape[1], img.shape[2], img.shape[0]
+            masks = np.zeros((H, W, D, 0), dtype=bool)
+        else:
+            try:
                 with bz2.BZ2File(info["m_path"], 'rb') as f:
                     m = cPickle.load(f)  # (Z, Y, X, N)
-                masks = np.transpose(m, (1, 2, 0, 3))  # → (Y, X, Z, N)
-        else:
-            masks = None
+                masks = np.transpose(m, (1, 2, 0, 3))  # -> (Y, X, Z, N)
+
+                # Обеспечиваем соответствие количества масок и боксов
+                if masks.shape[-1] != boxes.shape[0]:
+                    min_count = min(masks.shape[-1], boxes.shape[0])
+                    if min_count > 0:
+                        masks = masks[..., :min_count]
+                        boxes = boxes[:min_count]
+                        class_ids = class_ids[:min_count]
+                    else:
+                        H, W, D = masks.shape[:3]
+                        masks = np.zeros((H, W, D, 0), dtype=bool)
+                        boxes = np.zeros((0, 6), dtype=np.int32)
+                        class_ids = np.zeros((0,), dtype=np.int32)
+
+            except Exception as e:
+                print(f"[Dataset][{image_id}] Mask loading failed: {e}")
+                img = imread(info["path"])
+                H, W, D = img.shape[1], img.shape[2], img.shape[0]
+                masks = np.zeros((H, W, D, 0), dtype=bool)
 
         return boxes, class_ids, masks
 
 
+
 class ToyHeadDataset(Dataset):
+    """Head-датасет после TARGET_GENERATION: гибко читаем CSV c rois_aligned/target_*."""
+
+    def __init__(self, *args, **kwargs):
+        try: super(ToyHeadDataset, self).__init__()
+        except Exception: pass
+        if not hasattr(self, "image_info") or self.image_info is None:
+            self.image_info = []
+        cfg = kwargs.get("config", None)
+        if cfg is not None: self.config = cfg
+        if not hasattr(self, "num_classes") or self.num_classes is None:
+            try:    self.num_classes = int(getattr(self.config, "NUM_CLASSES", 2))
+            except Exception: self.num_classes = 2
 
     def load_dataset(self, data_dir, is_train=True):
-        '''
-        An image is defined in the dataset by:
-        # image_id, an image id [type: str of size 7]
-        # path, the path of its origin 3D image [type: str]
-        # seg_path, the path of the segmented 3D image [type: str]
-        # ann_time_step, the time step of the origin 3D image (for validation test) [type: str of size 3]
-        # ann_section_type, the type of section of the origin 3D image (x, y or z) [type: str of form 'x-section']
-        # ann_section_id, the index of the section in regard to the origin image [type: str of size 3]
-        # ann_mean = the mean of the origin 3D image pixel values [type: float]
-        # ann_std = the standard deviation of the origin 3D image pixel values
-        '''
+        """Обязательные поля: rois_aligned/ra_path И target_class_ids/tci_path (названия гибкие)."""
+        import os, pandas as pd
         self.add_class("dataset", 1, "neuron")
 
+        split = "train" if is_train else "test"
+        csv_path = os.path.join(data_dir, "datasets", f"{split}.csv")
+        td = pd.read_csv(csv_path, sep=None, engine="python")
+        cols = {c.lower(): c for c in td.columns}
 
-        if is_train:
-            td = pd.read_csv(f"{data_dir}datasets/train.csv", header=[0])
-            for i in range(len(td)):
-                r_path = td["rois"][i]
-                ra_path = td["rois_aligned"][i]
-                ma_path = td["mask_aligned"][i]
-                tci_path = td["target_class_ids"][i]
-                tb_path = td["target_bbox"][i]
-                tm_path = td["target_mask"][i]
-                self.add_image('dataset', image_id=i, path=r_path, ra_path=ra_path, ma_path=ma_path, tci_path=tci_path,
-                               tb_path=tb_path, tm_path=tm_path)
-            print('Training dataset is loaded.')
-        else:
-            td = pd.read_csv(f"{data_dir}datasets/test.csv", header=[0])
-            for i in range(len(td)):
-                r_path = td["rois"][i]
-                ra_path = td["rois_aligned"][i]
-                ma_path = td["mask_aligned"][i]
-                tci_path = td["target_class_ids"][i]
-                tb_path = td["target_bbox"][i]
-                tm_path = td["target_mask"][i]
-                self.add_image('dataset', image_id=i, path=r_path, ra_path=ra_path, ma_path=ma_path, tci_path=tci_path,
-                               tb_path=tb_path, tm_path=tm_path)
-            print('Validation dataset is loaded.')
+        def pick(*cands, required=True):
+            for c in cands:
+                k = c.lower()
+                if k in cols: return cols[k]
+                for lc, orig in cols.items():
+                    if k in lc: return orig
+            if required:
+                raise KeyError(f"[ToyHeadDataset.load_dataset] none of columns {cands} found. Available: {list(td.columns)}")
+            return None
+
+        col_rois = pick("rois", "rois_path", required=False)
+        col_ra   = pick("rois_aligned", "ra_path", "aligned_rois", "roisAligned", required=True)
+        col_ma   = pick("mask_aligned", "ma_path", "aligned_mask", required=False)
+        col_tci  = pick("target_class_ids", "tci_path", "tci", required=True)
+        col_tb   = pick("target_bbox", "tb_path", "bbox", required=False)
+        col_tm   = pick("target_mask", "tm_path", "tm", required=False)
+
+        print(f"[ToyHeadDataset] Using columns -> rois:'{col_rois}', ra:'{col_ra}', ma:'{col_ma}', "
+              f"tci:'{col_tci}', tb:'{col_tb}', tm:'{col_tm}'", flush=True)
+
+        for i in range(len(td)):
+            r_path   = td.at[i, col_rois] if col_rois is not None else None
+            ra_path  = td.at[i, col_ra]
+            ma_path  = td.at[i, col_ma] if col_ma is not None else None
+            tci_path = td.at[i, col_tci]
+            tb_path  = td.at[i, col_tb] if col_tb is not None else None
+            tm_path  = td.at[i, col_tm] if col_tm is not None else None
+
+            # обязательный image_info['path'] — rois, иначе ra, иначе ma
+            path = r_path if (isinstance(r_path, str) and r_path) else (ra_path if isinstance(ra_path, str) and ra_path else ma_path)
+            if not isinstance(path, str) or not path:
+                raise ValueError(f"[ToyHeadDataset] bad path fallback at row {i} (no rois/ra/ma string value)")
+
+            self.add_image('dataset', image_id=i, path=path,
+                           ra_path=ra_path, ma_path=ma_path,
+                           tci_path=tci_path, tb_path=tb_path, tm_path=tm_path)
+
+        print('Training dataset is loaded.' if is_train else 'Validation dataset is loaded.', flush=True)
+
+    def load_image(self, image_id, z_slice=None):
+        """Нужен только для совместимости проверок. Возвращаем dummy [H,W,D,1] из конфига."""
+        H, W, D = tuple(getattr(self, "config", None).IMAGE_SHAPE[:3])
+        return np.zeros((H, W, D, 1), dtype=np.float32)
 
     def load_data(self, image_id):
+        """Возвращает РОВНО 5 массивов для головы:
+        rois_aligned, mask_aligned, target_class_ids, target_bbox, target_mask
+        (все — numpy.ndarray; маски распаковываются из packbits; при отсутствии масок возвращаются нули)."""
+        import numpy as np
         info = self.image_info[image_id]
-        rois_aligned = np.load(info["ra_path"])
-        mask_aligned = np.load(info["ma_path"])
-        target_class_ids = np.load(info["tci_path"])
-        target_bbox = np.load(info["tb_path"])
-        target_mask = np.load(info["tm_path"])
-        return rois_aligned, mask_aligned, target_class_ids, target_bbox, target_mask
 
+        def _load_any(path):
+            if path is None:
+                return {"arr_0": None}
+            p = str(path)
+            if p.endswith(".npz"):
+                return np.load(p, allow_pickle=False)
+            arr = np.load(p, allow_pickle=False)
+            return {"arr_0": arr}
+
+        def _pick(z, *keys, fallback="arr_0"):
+            for k in keys:
+                if z is not None and k in z:
+                    return z[k]
+            if z is None:
+                return None
+            if hasattr(z, "files") and z.files:
+                return z[z.files[0]]
+            return z[fallback]
+
+        def _unbit(z, bits_key, shape_key, fallback_key):
+            """Распаковка битовых масок: (bits, shape) -> ndarray по shape."""
+            if z is None:
+                return None
+            if bits_key in z and shape_key in z:
+                bits = z[bits_key]
+                shape = z[shape_key].astype(np.int64)
+                flat = np.unpackbits(bits)
+                need = int(np.prod(shape))
+                if flat.shape[0] < need:
+                    flat = np.pad(flat, (0, need - flat.shape[0]), mode="constant")
+                arr = flat[:need].reshape(tuple(shape)).astype(np.uint8, copy=False)
+                return arr
+            return _pick(z, fallback_key)
+
+        # читаем все артефакты
+        z_ra = _load_any(info.get("ra_path"))
+        z_ma = _load_any(info.get("ma_path"))
+        z_tci = _load_any(info.get("tci_path"))
+        z_tb = _load_any(info.get("tb_path"))
+        z_tm = _load_any(info.get("tm_path"))
+
+        rois_aligned = _pick(z_ra, "rois_aligned", "ra", "arr_0")
+        mask_aligned = _unbit(z_ma, "mask_bits", "mask_shape", "mask_aligned")
+        target_class_ids = _pick(z_tci, "tci", "target_class_ids", "arr_0")
+        target_bbox = _pick(z_tb, "bbox", "target_bbox", "arr_0")
+        target_mask = _unbit(z_tm, "tm_bits", "tm_shape", "tm")
+
+        # приведение форм и типов
+        if rois_aligned is not None:
+            rois_aligned = np.asarray(rois_aligned, dtype=np.float32)
+        if target_class_ids is not None:
+            target_class_ids = np.asarray(target_class_ids, dtype=np.int32)
+        if target_bbox is not None:
+            target_bbox = np.asarray(target_bbox, dtype=np.float32)
+
+        # ИСПРАВЛЕНИЕ: НЕ убираем канальную ось, а гарантируем её наличие
+        def _ensure_5d_mask(x):
+            """Гарантируем форму [T, mH, mW, mD, C]"""
+            if x is None:
+                return None
+            x = np.asarray(x)
+            if x.ndim == 4:  # [T, mH, mW, mD] -> [T, mH, mW, mD, 1]
+                return x[..., np.newaxis]
+            elif x.ndim == 5:  # уже [T, mH, mW, mD, C]
+                return x
+            else:
+                return None
+
+        mask_aligned = _ensure_5d_mask(mask_aligned)
+        target_mask = _ensure_5d_mask(target_mask)
+
+        # инференция размеров для фолбэков
+        def _infer_T():
+            if rois_aligned is not None and rois_aligned.ndim >= 1:
+                return int(rois_aligned.shape[0])
+            if target_class_ids is not None and target_class_ids.ndim >= 1:
+                return int(target_class_ids.shape[0])
+            return 0
+
+        T = _infer_T()
+
+        # ИСПРАВЛЕННЫЕ фолбэки с правильными размерностями
+        if mask_aligned is None:
+            # Используем размеры из конфига
+            cfg = getattr(self, "config", None)
+            if cfg:
+                M = int(getattr(cfg, "MASK_POOL_SIZE", 14))
+                C = int(getattr(cfg, "TOP_DOWN_PYRAMID_SIZE", 256))
+            else:
+                M, C = 14, 256
+            mask_aligned = np.zeros((T, M, M, M, C), dtype=np.float32)
+        else:
+            mask_aligned = mask_aligned.astype(np.float32, copy=False)
+
+        if target_mask is None:
+            # Используем MASK_SHAPE из конфига
+            cfg = getattr(self, "config", None)
+            if cfg and hasattr(cfg, "MASK_SHAPE"):
+                M = int(cfg.MASK_SHAPE[0])
+            else:
+                M = 28  # значение по умолчанию
+            target_mask = np.zeros((T, M, M, M, 1), dtype=np.float32)
+        else:
+            target_mask = target_mask.astype(np.float32, copy=False)
+
+        return rois_aligned, mask_aligned, target_class_ids, target_bbox, target_mask
 
 
 ############################################################
