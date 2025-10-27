@@ -5,7 +5,7 @@
     "IMAGE_SIZE": 256,
     "IMAGE_DEPTH": 12,
     "IMAGE_CHANNEL_COUNT": 1,
-    "MAX_GT_INSTANCES": 25,
+    "MAX_GT_INSTANCES": 6,
     "USE_MINI_MASK": false, 
     "OUTPUT_DIR": "/NAS/mmaiurov/Datasets/rat_neurons_3d_tif_256_patches/results/",
 
@@ -13,17 +13,18 @@
 
     "BACKBONE": "resnet50", 
     "TOP_DOWN_PYRAMID_SIZE": 256, 
-    "RPN_TRAIN_ANCHORS_PER_IMAGE": 4096,
-    "PRE_NMS_LIMIT": 30000,
-    "POST_NMS_ROIS_TRAINING": 4000,
-    "POST_NMS_ROIS_INFERENCE": 3500,
+    "RPN_TRAIN_ANCHORS_PER_IMAGE": 1536,
+    "PRE_NMS_LIMIT": 15000,
+    "POST_NMS_ROIS_TRAINING": 6000,
+    "POST_NMS_ROIS_INFERENCE": 8000,
 
-    "TRAIN_ROIS_PER_IMAGE": 512,
-    "ROI_POSITIVE_RATIO": 0.5,
+    "TRAIN_ROIS_PER_IMAGE": 128,
+    "ROI_POSITIVE_RATIO": 0.7,
+
     "FPN_CLASSIF_FC_LAYERS_SIZE": 512,
-    "DETECTION_MAX_INSTANCES": 40,
+    "DETECTION_MAX_INSTANCES": 6,
 
-    "DETECTION_MIN_CONFIDENCE": 0.1,
+    "DETECTION_MIN_CONFIDENCE": 0.5,
     "DETECTION_NMS_THRESHOLD": 0.3,
 
     "GPU_COUNT": 1, 
@@ -33,22 +34,29 @@
     "WEIGHT_DIR": "weights/scp_mrcnn_rats/",
     "EPOCHS": 20, 
     "FROM_EPOCH": 0,
-    "RPN_WEIGHTS": "weights/scp_rpn_rats/EPOCH_006.h5",
-    "HEAD_WEIGHTS": "weights/scp_heads_rats/latest.h5",
+    "RPN_WEIGHTS": "weights/scp_rpn_rats/best.h5",
+    "HEAD_WEIGHTS": "weights/scp_heads_rats/best.h5",
 
-    "BACKBONE_STRIDES": [[4,4,2],[8,8,2],[16,16,2],[32,32,2],[64,64,2]],
-    "RPN_ANCHOR_SCALES": [48, 56, 64, 80, 120],
-    "RPN_ANCHOR_RATIOS": [0.04, 0.06, 0.08, 0.01, 0.11, 0.12],
+    "BACKBONE_STRIDES": [[4,4,1],[8,8,1],[16,16,1],[32,32,1],[64,64,1]],
+    "RPN_ANCHOR_SCALES": [25, 57, 84, 109, 135],
+    "RPN_ANCHOR_RATIOS": [0.05, 0.06, 0.15],
     "RPN_ANCHOR_STRIDE":  1,
-    "RPN_BBOX_STD_DEV": [0.10, 0.10, 0.08, 0.20, 0.20, 0.15],
-
+    "RPN_BBOX_STD_DEV": [0.1, 0.1, 0.1, 0.213, 0.21, 0.15],
+    "BBOX_STD_DEV": [0.1, 0.1, 0.1, 0.213, 0.21, 0.15],
+    "RPN_NMS_THRESHOLD": 0.7,
+    "RPN_POSITIVE_IOU": 0.25,
+    "RPN_NEGATIVE_IOU": 0.15,
     "POOL_SIZE": 7,
     "MASK_POOL_SIZE": 14,
 
-    "RPN_NMS_THRESHOLD": 0.70,
-    "HEAD_CONV_CHANNEL": 256,
+    "MIN_ROI_SIZE": 0.039,
 
-    "ATSS_TOPK": 12,
-    "ATSS_MIN_POS_PER_GT": 3,
+    "HEAD_CONV_CHANNEL": 256,
+    "HEAD_MAX_ROIS": 2000,
+
+    "ATSS_TOPK": 64,
+    "ATSS_MIN_POS_PER_GT": 20,
+    "EVAL_TOPK_RPN": 10000,
+    "VOXEL_Z_OVER_Y": 1.0,
     "AUGMENT": false
 }

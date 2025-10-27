@@ -75,27 +75,238 @@ def compute_iou(box, boxes, box_area, boxes_area):
     return iou
 
 
+def compute_overlaps_3d(boxes1, boxes2, image_shape=None):
+    """3D IoU с учетом анизотропии."""
+    if boxes1 is None or boxes2 is None:
+        return np.zeros((0, 0), dtype=np.float32)
+
+    b1 = np.asarray(boxes1, dtype=np.float32)
+    b2 = np.asarray(boxes2, dtype=np.float32)
+
+    if b1.size == 0 or b2.size == 0:
+        N1 = b1.shape[0] if b1.ndim == 2 else 0
+        N2 = b2.shape[0] if b2.ndim == 2 else 0
+        return np.zeros((N1, N2), dtype=np.float32)
+
+    # Нормализация углов
+    def _norm(b):
+        y1 = np.minimum(b[:, 0], b[:, 3]);
+        y2 = np.maximum(b[:, 0], b[:, 3])
+        x1 = np.minimum(b[:, 1], b[:, 4]);
+        x2 = np.maximum(b[:, 1], b[:, 4])
+        z1 = np.minimum(b[:, 2], b[:, 5]);
+        z2 = np.maximum(b[:, 2], b[:, 5])
+        out = b.copy()
+        out[:, 0], out[:, 1], out[:, 2] = y1, x1, z1
+        out[:, 3], out[:, 4], out[:, 5] = y2, x2, z2
+        return out
+
+    b1, b2 = _norm(b1), _norm(b2)
+
+    # Коэффициент анизотропии для IMAGE_DEPTH=12
+    # aniso_z = 1.0
+    # if image_shape is not None:
+    #     H, W, D = image_shape
+    #     aniso_z = max(1.0, np.sqrt(max(H, W) / max(D, 1.0)))
+
+    # Векторизованное вычисление
+    b1_exp = b1[:, np.newaxis, :]
+    b2_exp = b2[np.newaxis, :, :]
+
+    # Intersection
+    y1_i = np.maximum(b1_exp[:, :, 0], b2_exp[:, :, 0])
+    x1_i = np.maximum(b1_exp[:, :, 1], b2_exp[:, :, 1])
+    z1_i = np.maximum(b1_exp[:, :, 2], b2_exp[:, :, 2])
+    y2_i = np.minimum(b1_exp[:, :, 3], b2_exp[:, :, 3])
+    x2_i = np.minimum(b1_exp[:, :, 4], b2_exp[:, :, 4])
+    z2_i = np.minimum(b1_exp[:, :, 5], b2_exp[:, :, 5])
+
+    h_i = np.maximum(y2_i - y1_i, 0.0)
+    w_i = np.maximum(x2_i - x1_i, 0.0)
+    #d_i = np.maximum(z2_i - z1_i, 0.0) * aniso_z
+    d_i = np.maximum(z2_i - z1_i, 0.0)
+    intersection = h_i * w_i * d_i
+
+    # Volumes
+    h1 = b1[:, 3] - b1[:, 0]
+    w1 = b1[:, 4] - b1[:, 1]
+    #d1 = (b1[:, 5] - b1[:, 2]) * aniso_z
+    d1 = (b1[:, 5] - b1[:, 2])
+    vol1 = (h1 * w1 * d1)[:, np.newaxis]
+
+    h2 = b2[:, 3] - b2[:, 0]
+    w2 = b2[:, 4] - b2[:, 1]
+    #d2 = (b2[:, 5] - b2[:, 2]) * aniso_z
+    d2 = (b2[:, 5] - b2[:, 2])
+    vol2 = (h2 * w2 * d2)[np.newaxis, :]
+
+    union = np.maximum(vol1 + vol2 - intersection, 1e-10)
+    return np.clip(intersection / union, 0.0, 1.0).astype(np.float32)
+
+# совместимость импортов (ничего больше в проекте править не нужно)
 def compute_overlaps(boxes1, boxes2):
-    """Computes IoU overlaps between two sets of boxes.
-    boxes1, boxes2: [N, (y1, x1, z1, y2, x2, z2)].
+    return compute_overlaps_3d(boxes1, boxes2)
 
-    For better performance, pass the largest set first and the smaller second.
+
+def apply_box_deltas_3d_graph(boxes, deltas, bbox_std_dev):
     """
-    if boxes1.size == 0 or boxes2.size == 0:
-        # Вернём корректную «пустую» матрицу пересечений,
-        # чтобы остальной код не падал.
-        return np.zeros((boxes1.shape[0], boxes2.shape[0]), dtype=np.float16)
-    # Areas of anchors and GT boxes
-    area1 = (boxes1[:, 3] - boxes1[:, 0]) * (boxes1[:, 4] - boxes1[:, 1]) * (boxes1[:, 5] - boxes1[:, 2])
-    area2 = (boxes2[:, 3] - boxes2[:, 0]) * (boxes2[:, 4] - boxes2[:, 1]) * (boxes2[:, 5] - boxes2[:, 2])
+    boxes : [N,6] НОРМАЛИЗОВАННЫЕ [0,1]
+    deltas: [N,6] (dy,dx,dz, log(dh),log(dw),log(dd))
+    """
+    boxes = tf.cast(boxes, tf.float32)
+    deltas = tf.cast(deltas, tf.float32)
+    bbox_std_dev = tf.cast(bbox_std_dev, tf.float32)
 
-    # Compute overlaps to generate matrix [boxes1 count, boxes2 count]
-    # Each cell contains the IoU value.
-    overlaps = np.zeros((boxes1.shape[0], boxes2.shape[0]), dtype=np.float16)
-    for i in range(overlaps.shape[1]):
-        box2 = boxes2[i]
-        overlaps[:, i] = compute_iou(box2, boxes1, area2[i], area1)
-    return overlaps
+    boxes.set_shape([None, 6])
+    deltas.set_shape([None, 6])
+
+    deltas = deltas * bbox_std_dev
+
+    y1, x1, z1, y2, x2, z2 = [tf.squeeze(t, axis=1) for t in tf.split(boxes, 6, axis=1)]
+    dy, dx, dz, dh, dw, dd = [tf.squeeze(t, axis=1) for t in tf.split(deltas, 6, axis=1)]
+
+    h = y2 - y1
+    w = x2 - x1
+    d = z2 - z1
+
+    cy = y1 + 0.5 * h
+    cx = x1 + 0.5 * w
+    cz = z1 + 0.5 * d
+
+    LOG_SCALE_LIMIT = tf.math.log(1000.0 / 16.0)
+    dh = tf.clip_by_value(dh, -LOG_SCALE_LIMIT, LOG_SCALE_LIMIT)
+    dw = tf.clip_by_value(dw, -LOG_SCALE_LIMIT, LOG_SCALE_LIMIT)
+    dd = tf.clip_by_value(dd, -LOG_SCALE_LIMIT, LOG_SCALE_LIMIT)
+
+    cy2 = cy + dy * h
+    cx2 = cx + dx * w
+    cz2 = cz + dz * d
+
+    h2 = h * tf.exp(dh)
+    w2 = w * tf.exp(dw)
+    d2 = d * tf.exp(dd)
+
+    y1n = cy2 - 0.5 * h2
+    x1n = cx2 - 0.5 * w2
+    z1n = cz2 - 0.5 * d2
+    y2n = y1n + h2
+    x2n = x1n + w2
+    z2n = z1n + d2
+
+    out = tf.stack([y1n, x1n, z1n, y2n, x2n, z2n], axis=1)
+    out.set_shape([None, 6])
+    return out
+
+
+def norm_boxes_3d_graph(boxes, shape):
+    """
+    Нормализует 3D боксы из pixel в [0,1].
+    ИСПРАВЛЕНО: БЕЗ shift для согласованности.
+    """
+    h = tf.cast(shape[0], tf.float32)
+    w = tf.cast(shape[1], tf.float32)
+    d = tf.cast(shape[2], tf.float32)
+
+    scale = tf.stack([h, w, d, h, w, d])  # БЕЗ -1!
+    boxes = tf.cast(boxes, tf.float32)
+    return tf.clip_by_value(boxes / scale, 0.0, 1.0)
+
+
+def denorm_boxes_3d_graph(boxes, shape):
+    """
+    Денормализует 3D боксы из [0,1] в pixels.
+    ИСПРАВЛЕНО: БЕЗ shift для согласованности.
+    """
+    h = tf.cast(shape[0], tf.float32)
+    w = tf.cast(shape[1], tf.float32)
+    d = tf.cast(shape[2], tf.float32)
+
+    scale = tf.stack([h, w, d, h, w, d])  # БЕЗ -1!
+    boxes = tf.cast(boxes, tf.float32)
+    return boxes * scale
+
+def trim_zeros_graph(boxes, name=None):
+    """
+    Удаляет нулевой padding из боксов.
+    boxes: [N, 6] в любых координатах
+    Возвращает: (trimmed_boxes, non_zeros_mask)
+    """
+    non_zeros = tf.cast(tf.reduce_sum(tf.abs(boxes), axis=1), tf.bool)
+    boxes = tf.boolean_mask(boxes, non_zeros, name=name)
+    return boxes, non_zeros
+
+
+def box_refinement_graph(box, gt_box):
+    """
+    Вычисляет дельты для перехода от box к gt_box (3D).
+    box:    [N,6] (y1,x1,z1,y2,x2,z2)
+    gt_box: [N,6] (y1,x1,z1,y2,x2,z2)
+    Возвращает: [N,6] дельты
+    """
+    box = tf.cast(box, tf.float32)
+    gt_box = tf.cast(gt_box, tf.float32)
+    
+    h = box[:, 3] - box[:, 0]
+    w = box[:, 4] - box[:, 1]
+    d = box[:, 5] - box[:, 2]
+    center_y = box[:, 0] + 0.5 * h
+    center_x = box[:, 1] + 0.5 * w
+    center_z = box[:, 2] + 0.5 * d
+    
+    gt_h = gt_box[:, 3] - gt_box[:, 0]
+    gt_w = gt_box[:, 4] - gt_box[:, 1]
+    gt_d = gt_box[:, 5] - gt_box[:, 2]
+    gt_center_y = gt_box[:, 0] + 0.5 * gt_h
+    gt_center_x = gt_box[:, 1] + 0.5 * gt_w
+    gt_center_z = gt_box[:, 2] + 0.5 * gt_d
+    
+    dy = (gt_center_y - center_y) / tf.maximum(h, 1e-3)
+    dx = (gt_center_x - center_x) / tf.maximum(w, 1e-3)
+    dz = (gt_center_z - center_z) / tf.maximum(d, 1e-3)
+    dh = tf.math.log(tf.maximum(gt_h / tf.maximum(h, 1e-3), 1e-6))
+    dw = tf.math.log(tf.maximum(gt_w / tf.maximum(w, 1e-3), 1e-6))
+    dd = tf.math.log(tf.maximum(gt_d / tf.maximum(d, 1e-3), 1e-6))
+    
+    return tf.stack([dy, dx, dz, dh, dw, dd], axis=1)
+
+
+def batch_pack_graph(x, counts, num_rows):
+    """
+    Упаковывает тензор x в батч по counts.
+    x: [sum(counts), ...]
+    counts: [num_rows] - кол-во элементов на ряд
+    num_rows: количество рядов (батч)
+    """
+    outputs = []
+    for i in range(num_rows):
+        outputs.append(x[int(tf.reduce_sum(counts[:i])):int(tf.reduce_sum(counts[:i + 1]))])
+    return tf.concat(outputs, axis=0)
+
+
+def parse_image_meta_graph(image_meta):
+    """
+    Парсит image_meta тензор и возвращает словарь с полями.
+    image_meta: [batch, meta_length] или [meta_length]
+    Возвращает: dict с image_shape, window и т.д.
+    """
+    # Если 1D - добавляем batch dimension
+    if len(image_meta.shape) == 1:
+        image_meta = tf.expand_dims(image_meta, 0)
+    
+    # Формат meta: [image_id, H, W, D, ...window(6), ...]
+    # Стандартная распаковка:
+    image_id = image_meta[:, 0]
+    image_shape = image_meta[:, 1:4]  # [B, 3] (H,W,D)
+    window = image_meta[:, 4:10]      # [B, 6] (y1,x1,z1,y2,x2,z2)
+    
+    return {
+        'image_id': tf.cast(image_id, tf.int32),
+        'image_shape': tf.cast(image_shape, tf.int32),
+        'window': window
+    }
+
+
+
 
 
 def compute_overlaps_masks(masks1, masks2):
@@ -125,25 +336,20 @@ def compute_overlaps_masks(masks1, masks2):
 
 def apply_box_deltas_3d(boxes, deltas, bbox_std_dev=None):
     """
-    Универсальная обёртка: работает и с TF-тензорами (граф), и с NumPy.
-    При наличии bbox_std_dev денормализует дельты (как на тренировке).
-    boxes : [N,6] (y1,x1,z1,y2,x2,z2)
+    boxes : [N,6] (y1,x1,z1,y2,x2,z2) - НОРМАЛИЗОВАННЫЕ [0,1]
     deltas: [N,6] (dy,dx,dz, log(dh),log(dw),log(dd))
-    bbox_std_dev: None или [6]
     """
-    # Если это TF-тензоры — отправляем в графовую реализацию.
     try:
         if tf.is_tensor(boxes) or tf.is_tensor(deltas):
             if bbox_std_dev is None:
                 bbox_std_dev = tf.ones([6], dtype=tf.float32)
             return apply_box_deltas_3d_graph(boxes, deltas, bbox_std_dev)
-    except NameError:
-        # tf не импортирован — упадём в NumPy путь ниже
+    except (NameError, AttributeError):
         pass
 
-    # --- NumPy путь (eval/offline) ---
     boxes = np.asarray(boxes, dtype=np.float32)
     deltas = np.asarray(deltas, dtype=np.float32)
+
     if bbox_std_dev is not None:
         deltas = deltas * np.asarray(bbox_std_dev, dtype=np.float32)
 
@@ -155,11 +361,14 @@ def apply_box_deltas_3d(boxes, deltas, bbox_std_dev=None):
     cx = boxes[:, 1] + 0.5 * w
     cz = boxes[:, 2] + 0.5 * d
 
-    h = np.maximum(h, 1.0)
-    w = np.maximum(w, 1.0)
-    d = np.maximum(d, 1.0)
+    # ✅ ИСПРАВЛЕНИЕ: минимум для НОРМАЛИЗОВАННЫХ координат
+    eps = 1e-6  # просто защита от деления на 0
+    h = np.maximum(h, eps)
+    w = np.maximum(w, eps)
+    d = np.maximum(d, eps)
 
     dy, dx, dz, dh, dw, dd = deltas.T
+
     # защита от экспоненциальных выбросов
     dh = np.clip(dh, -4.0, 4.0)
     dw = np.clip(dw, -4.0, 4.0)
@@ -168,13 +377,15 @@ def apply_box_deltas_3d(boxes, deltas, bbox_std_dev=None):
     cy = cy + dy * h
     cx = cx + dx * w
     cz = cz + dz * d
-    h  = h * np.exp(dh)
-    w  = w * np.exp(dw)
-    d  = d * np.exp(dd)
 
-    h = np.maximum(h, 1.0)
-    w = np.maximum(w, 1.0)
-    d = np.maximum(d, 1.0)
+    h = h * np.exp(dh)
+    w = w * np.exp(dw)
+    d = d * np.exp(dd)
+
+    # ✅ Минимум для НОРМАЛИЗОВАННЫХ (или вообще убрать)
+    h = np.maximum(h, eps)
+    w = np.maximum(w, eps)
+    d = np.maximum(d, eps)
 
     y1 = cy - 0.5 * h
     x1 = cx - 0.5 * w
@@ -182,25 +393,17 @@ def apply_box_deltas_3d(boxes, deltas, bbox_std_dev=None):
     y2 = y1 + h
     x2 = x1 + w
     z2 = z1 + d
+
     return np.stack([y1, x1, z1, y2, x2, z2], axis=1)
 
-def norm_boxes_3d_graph(boxes, image_shape):
-    """ boxes [N,6] px -> norm по (H-1,W-1,D-1). """
-    boxes = tf.cast(boxes, tf.float32)
-    image_shape = tf.cast(image_shape, tf.float32)  # [H,W,D]
-    h, w, d = image_shape[0], image_shape[1], image_shape[2]
-    scale = tf.stack([h - 1.0, w - 1.0, d - 1.0, h - 1.0, w - 1.0, d - 1.0])
-    out = boxes / scale
-    # фиксируем known last-dim
-    out.set_shape([None, 6])
-    return out
+
 
 def denorm_boxes_3d_graph(boxes, image_shape):
-    """ boxes [N,6] norm -> px по (H-1,W-1,D-1). """
+
     boxes = tf.cast(boxes, tf.float32)
     image_shape = tf.cast(image_shape, tf.float32)  # [H,W,D]
     h, w, d = image_shape[0], image_shape[1], image_shape[2]
-    scale = tf.stack([h - 1.0, w - 1.0, d - 1.0, h - 1.0, w - 1.0, d - 1.0])
+    scale = tf.stack([h, w, d, h, w, d])
     out = boxes * scale
     out.set_shape([None, 6])
     return out
@@ -408,70 +611,79 @@ def compute_detection_score(proposals, gt_boxes, threshold=0.5):
         score = recall * 100.0  # Шкала от 0 до 100
 
     return score
+
+
 def box_refinement_graph(box, gt_box):
     """
-    Compute refinement needed to transform box to gt_box.
-
-    Args:
-        box and gt_box are [N, (y1, x1, z1, y2, x2, z2)]
-
-    Returns:
-        results: the delta to apply to box to obtain gt_box
+    Вычисляет дельты для перехода от box к gt_box (3D).
+    box:    [N,6] (y1,x1,z1,y2,x2,z2) - НОРМАЛИЗОВАННЫЕ [0,1]
+    gt_box: [N,6] (y1,x1,z1,y2,x2,z2) - НОРМАЛИЗОВАННЫЕ [0,1]
     """
     box = tf.cast(box, tf.float32)
     gt_box = tf.cast(gt_box, tf.float32)
 
-    height = box[:, 3] - box[:, 0]
-    width = box[:, 4] - box[:, 1]
-    depth = box[:, 5] - box[:, 2]
-    center_y = box[:, 0] + 0.5 * height
-    center_x = box[:, 1] + 0.5 * width
-    center_z = box[:, 2] + 0.5 * depth
+    eps = 1e-6  # ✅ защита от деления на 0
 
-    gt_height = gt_box[:, 3] - gt_box[:, 0]
-    gt_width = gt_box[:, 4] - gt_box[:, 1]
-    gt_depth = gt_box[:, 5] - gt_box[:, 2]
-    gt_center_y = gt_box[:, 0] + 0.5 * gt_height
-    gt_center_x = gt_box[:, 1] + 0.5 * gt_width
-    gt_center_z = gt_box[:, 2] + 0.5 * gt_depth
+    h = box[:, 3] - box[:, 0]
+    w = box[:, 4] - box[:, 1]
+    d = box[:, 5] - box[:, 2]
+    center_y = box[:, 0] + 0.5 * h
+    center_x = box[:, 1] + 0.5 * w
+    center_z = box[:, 2] + 0.5 * d
 
-    dy = (gt_center_y - center_y) / height
-    dx = (gt_center_x - center_x) / width
-    dz = (gt_center_z - center_z) / depth
-    dh = tf.math.log(gt_height / height)
-    dw = tf.math.log(gt_width / width)
-    dd = tf.math.log(gt_depth / depth)
+    gt_h = gt_box[:, 3] - gt_box[:, 0]
+    gt_w = gt_box[:, 4] - gt_box[:, 1]
+    gt_d = gt_box[:, 5] - gt_box[:, 2]
+    gt_center_y = gt_box[:, 0] + 0.5 * gt_h
+    gt_center_x = gt_box[:, 1] + 0.5 * gt_w
+    gt_center_z = gt_box[:, 2] + 0.5 * gt_d
 
-    result = tf.stack([dy, dx, dz, dh, dw, dd], axis=1)
-    return result
+    # ✅ Используем eps вместо больших значений
+    dy = (gt_center_y - center_y) / tf.maximum(h, eps)
+    dx = (gt_center_x - center_x) / tf.maximum(w, eps)
+    dz = (gt_center_z - center_z) / tf.maximum(d, eps)
+
+    # ✅ Клиппинг перед log
+    dh = tf.math.log(tf.maximum(gt_h, eps) / tf.maximum(h, eps))
+    dw = tf.math.log(tf.maximum(gt_w, eps) / tf.maximum(w, eps))
+    dd = tf.math.log(tf.maximum(gt_d, eps) / tf.maximum(d, eps))
+
+    return tf.stack([dy, dx, dz, dh, dw, dd], axis=1)
 
 
 def box_refinement(box, gt_box):
-    """Compute refinement needed to transform box to gt_box.
-    box and gt_box are [N, (y1, x1, y2, x2)]. (y2, x2) is
-    assumed to be outside the box.
+    """
+    box и gt_box: [N, (y1, x1, z1, y2, x2, z2)] - НОРМАЛИЗОВАННЫЕ [0,1]
     """
     box = box.astype(np.float32)
     gt_box = gt_box.astype(np.float32)
 
+    eps = 1e-6  # ✅ защита от деления на 0
+
     height = box[:, 3] - box[:, 0]
     width = box[:, 4] - box[:, 1]
     depth = box[:, 5] - box[:, 2]
     center_y = box[:, 0] + 0.5 * height
     center_x = box[:, 1] + 0.5 * width
     center_z = box[:, 2] + 0.5 * depth
+
     gt_height = gt_box[:, 3] - gt_box[:, 0]
     gt_width = gt_box[:, 4] - gt_box[:, 1]
     gt_depth = gt_box[:, 5] - gt_box[:, 2]
     gt_center_y = gt_box[:, 0] + 0.5 * gt_height
     gt_center_x = gt_box[:, 1] + 0.5 * gt_width
     gt_center_z = gt_box[:, 2] + 0.5 * gt_depth
-    dy = (gt_center_y - center_y) / height
-    dx = (gt_center_x - center_x) / width
-    dz = (gt_center_z - center_z) / depth
-    dh = np.log(gt_height / height)
-    dw = np.log(gt_width / width)
-    dd = np.log(gt_depth / depth)
+
+    # ✅ Используем eps
+    dy = (gt_center_y - center_y) / np.maximum(height, eps)
+    dx = (gt_center_x - center_x) / np.maximum(width, eps)
+    dz = (gt_center_z - center_z) / np.maximum(depth, eps)
+
+    # ✅ Клиппинг перед log
+    dh = np.log(np.maximum(gt_height, eps) / np.maximum(height, eps))
+    dw = np.log(np.maximum(gt_width, eps) / np.maximum(width, eps))
+    dd = np.log(np.maximum(gt_depth, eps) / np.maximum(depth, eps))
+
     return np.stack([dy, dx, dz, dh, dw, dd], axis=1)
 
 
@@ -811,105 +1023,124 @@ def unmold_mask(mask, bbox, image_shape):
 #  Anchors
 ############################################################
 
-def generate_anchors(scales, ratios, shape, feature_stride, anchor_stride):
-    """
-    Улучшенная функция генерации якорей для 3D
+def generate_anchors(scales, ratios, shape, feature_stride, anchor_stride, max_depth=None):
+    import numpy as np
 
-    scales: базовые размеры по Y и X (в пикселях исходника)
-    ratios: коэффициенты глубины по Z (пример: [0.125, 0.25, 0.5, 1.0])
-    shape: [height, width, depth] признаковой карты
-    feature_stride: int или (sy, sx, sz)
-    anchor_stride: int (шаг по сетке признаковой карты)
-    """
-    # stride по осям
-    if isinstance(feature_stride, (int, np.integer)):
-        sy = sx = sz = int(feature_stride)
+    if isinstance(feature_stride, (list, tuple)):
+        if len(feature_stride) == 3:
+            sy, sx, sz = feature_stride
+        elif len(feature_stride) == 2:
+            sy = sx = feature_stride[0]
+            sz = feature_stride[1]
+        else:
+            sy = sx = sz = int(feature_stride[0])
     else:
-        sy, sx, sz = feature_stride
+        sy = sx = sz = int(feature_stride)
 
-    # сетка центров в координатах исходника
     shifts_y = np.arange(0, shape[0], anchor_stride) * sy
     shifts_x = np.arange(0, shape[1], anchor_stride) * sx
     shifts_z = np.arange(0, shape[2], anchor_stride) * sz
-    shifts_x, shifts_y, shifts_z = np.meshgrid(shifts_x, shifts_y, shifts_z)
 
-    # Используем телеметрию для определения оптимальных масштабов и соотношений
-    # По данным телеметрии, лучше всего работают масштабы 16, 20, 32, 40
-    # и соотношения 0.1, 0.125, 0.2
+    shifts_y, shifts_x, shifts_z = np.meshgrid(shifts_y, shifts_x, shifts_z, indexing='ij')
 
-    # Создаем сетку размеров с соотношениями
-    S, R = np.meshgrid(np.array(scales, dtype=np.float32),
-                       np.array(ratios, dtype=np.float32))
-    S = S.flatten();
-    R = R.flatten()
+    if isinstance(scales, (int, float)):
+        scales = [scales]
+    if isinstance(ratios, (int, float)):
+        ratios = [ratios]
 
-    # Размеры: для 3D якорей важно правильно масштабировать по Z
-    heights = S  # Y
-    widths = S  # X
-    depths = S * R  # Z - масштабируем соотношением
+    base_anchors = []
+    for scale in scales:
+        for ratio in ratios:
+            height = width = scale
+            depth = scale * ratio
 
-    # Центрируем якоря в узлах сетки
-    box_widths, box_centers_x = np.meshgrid(widths, shifts_x)
-    box_heights, box_centers_y = np.meshgrid(heights, shifts_y)
-    box_depths, box_centers_z = np.meshgrid(depths, shifts_z)
+            if max_depth is not None:
+                depth = np.clip(depth, 0.5, max_depth)
+            else:
+                depth = max(0.5, depth)
 
-    box_centers = np.stack([box_centers_y, box_centers_x, box_centers_z], axis=2).reshape([-1, 3])
-    box_sizes = np.stack([box_heights, box_widths, box_depths], axis=2).reshape([-1, 3])
+            base_anchors.append([
+                -height / 2, -width / 2, -depth / 2,
+                height / 2, width / 2, depth / 2
+            ])
 
-    # Убеждаемся, что размеры якорей не равны нулю
-    box_sizes = np.maximum(box_sizes, 1.0)
+    base_anchors = np.array(base_anchors, dtype=np.float32)
 
-    # Конвертируем центр и размер в (y1, x1, z1, y2, x2, z2)
-    boxes = np.concatenate([box_centers - 0.5 * box_sizes,
-                            box_centers + 0.5 * box_sizes], axis=1)
+    shifts_y_flat = shifts_y.ravel()
+    shifts_x_flat = shifts_x.ravel()
+    shifts_z_flat = shifts_z.ravel()
 
-    return boxes
+    shifts = np.stack([
+        shifts_y_flat, shifts_x_flat, shifts_z_flat,
+        shifts_y_flat, shifts_x_flat, shifts_z_flat
+    ], axis=1)
+
+    anchors = base_anchors[np.newaxis, :, :] + shifts[:, np.newaxis, :]
+    anchors = anchors.reshape(-1, 6)
+
+    return anchors.astype(np.float32)
 
 
-def generate_pyramid_anchors(scales, ratios, feature_shapes, feature_strides, anchor_stride):
-    """
-    Генерация 3D-якорей для пирамиды признаков.
-    Поддерживает любое количество scales: >, = или < числа уровней FPN.
-    - Если scales == #levels: по одному масштабу на уровень (классическое поведение).
-    - Если scales  > #levels: делим scales на чанки по уровням и генерируем якоря для каждого масштаба в чанке.
-    - Если scales  < #levels: недостающие уровни получают последний масштаб.
-    Дополнительно добавляем промежуточный масштаб между соседними базовыми на уровне.
-    """
-
+def generate_pyramid_anchors(scales, ratios, feature_shapes, feature_strides, anchor_stride, config=None):
+    import numpy as np
 
     L = len(feature_shapes)
-    # нормализуем scales в список float
-    try:
-        S = list(scales)
-    except TypeError:
-        S = [float(scales)] * L
-    S = [float(s) for s in S]
+    scales = sorted(list(scales))
+    n_scales = len(scales)
 
-    # распределим масштабы по уровням
-    if len(S) == L:
-        per_level = [[s] for s in S]
-    elif len(S) > L:
-        chunks = np.array_split(np.array(S, dtype=float), L)
-        per_level = [list(c) for c in chunks]
-    else:  # len(S) < L
-        per_level = [[s] for s in S] + [[S[-1]] for _ in range(L - len(S))]
+    max_depth = None
+    if config is not None:
+        max_depth = getattr(config, 'IMAGE_DEPTH', None)
+        if max_depth is None:
+            max_depth = getattr(config, 'IMAGE_SHAPE', (0, 0, 16))[2]
+
+    print(f"[ANCHORS] {n_scales} scales, {L} levels, max_depth={max_depth}")
+
+    level_scales = []
+    if n_scales >= L:
+        scales_per_level = n_scales // L
+        extra = n_scales % L
+        start = 0
+        for i in range(L):
+            end = start + scales_per_level + (1 if i < extra else 0)
+            level_scales.append(scales[start:end])
+            start = end
+    else:
+        for i in range(L):
+            level_scales.append([scales[min(i, n_scales - 1)]])
 
     anchors = []
-    for i in range(L):
-        # базовые якоря для всех масштабов, назначенных этому уровню
-        level_scales = sorted(per_level[i])
-        for si in level_scales:
-            anchors.append(
-                generate_anchors(si, ratios, feature_shapes[i], feature_strides[i], anchor_stride)
-            )
-        # промежуточные масштабы между соседними si на том же уровне
-        for a, b in zip(level_scales[:-1], level_scales[1:]):
-            mid = 0.5 * (a + b)
-            anchors.append(
-                generate_anchors(mid, ratios, feature_shapes[i], feature_strides[i], anchor_stride)
-            )
+    total_per_level = []
 
-    return np.concatenate(anchors, axis=0)
+    for level_idx in range(L):
+        stride = feature_strides[level_idx]
+        if isinstance(stride, (list, tuple)):
+            if len(stride) == 3:
+                stride_3d = [stride[0], stride[1], stride[2]]
+            elif len(stride) == 2:
+                stride_3d = [stride[0], stride[0], stride[1]]
+            else:
+                stride_3d = [stride[0], stride[0], stride[0]]
+        else:
+            stride_3d = [stride, stride, stride]
+
+        level_count = 0
+        for scale in level_scales[level_idx]:
+            level_anchors = generate_anchors(
+                scale, ratios, feature_shapes[level_idx],
+                stride_3d, anchor_stride, max_depth
+            )
+            anchors.append(level_anchors)
+            level_count += len(level_anchors)
+
+        total_per_level.append(level_count)
+        print(f"  P{level_idx + 2}: shape={feature_shapes[level_idx]}, stride={stride_3d}, "
+              f"scales={level_scales[level_idx]}, anchors={level_count}")
+
+    result = np.concatenate(anchors, axis=0)
+    print(f"[ANCHORS] Total: {len(result)}")
+    return result
+
 
 
 ############################################################
@@ -1020,8 +1251,9 @@ def compute_ap(gt_boxes, gt_class_ids, gt_masks,
 def rpn_evaluation(model, config, subsets, datasets, check_boxes):
     IOU_THRESH = float(getattr(config, "EVAL_MATCH_IOU", 0.50))
     IOU_GRID = list(getattr(config, "EVAL_MATCH_IOU_GRID", [0.30, 0.40, 0.50]))
-    topk = int(getattr(config, "EVAL_TOPK_RPN", 512))
+    topk = int(getattr(config, "EVAL_TOPK_RPN", 10000))
     det_at = {}
+
     for subset, dataset in zip(subsets, datasets):
         print(subset)
         generator = RPNGenerator(dataset=dataset, config=config, shuffle=False)
@@ -1037,60 +1269,77 @@ def rpn_evaluation(model, config, subsets, datasets, check_boxes):
         for k in range(steps):
             inputs, _ = generator.__getitem__(k)
             _, _, _, batch_rpn_rois, rpn_class_loss, rpn_bbox_loss = model.predict(inputs)
-            
-            for m in range(batch_rpn_rois.shape[0]):
-                ds_id = generator.image_ids[k * generator.batch_size + m]
+
+            # ✅ ИСПРАВЛЕНИЕ: правильный расчёт размера батча
+            batch_start = k * generator.batch_size
+            batch_end = min(batch_start + generator.batch_size, len(generator.image_ids))
+            actual_batch_size = batch_end - batch_start
+
+            for m in range(actual_batch_size):  # ✅ используем actual_batch_size
+                ds_id = generator.image_ids[batch_start + m]  # ✅ безопасный индекс
                 _, boxes, _ = generator.load_image_gt(ds_id)
+
                 # если GT пустой — только учтём лоссы
                 if boxes is None or boxes.shape[0] == 0:
                     class_loss.append(rpn_class_loss[m])
                     bbox_loss.append(rpn_bbox_loss[m])
                     continue
-                # денорм и отбор первых max_object_nb рои
+
+                # денорм и отбор первых topk ROI
                 rpn_rois = denorm_boxes(batch_rpn_rois[m, :topk], config.IMAGE_SHAPE[:3])
                 if rpn_rois is None or rpn_rois.shape[0] == 0:
-                    # учтём лоссы, но дальше не считаем метрики
                     class_loss.append(rpn_class_loss[m])
                     bbox_loss.append(rpn_bbox_loss[m])
                     continue
-                # обрезаем по размеру изображения и фильтруем нулевую/отрицательную площадь
+
+                # обрезаем по размеру изображения и фильтруем
                 H, W, D = config.IMAGE_SHAPE[:3]
-                rpn_rois[:, 0] = np.clip(rpn_rois[:, 0], 0, H)  # y1
-                rpn_rois[:, 1] = np.clip(rpn_rois[:, 1], 0, W)  # x1
-                rpn_rois[:, 2] = np.clip(rpn_rois[:, 2], 0, D)  # z1
-                rpn_rois[:, 3] = np.clip(rpn_rois[:, 3], 0, H)  # y2
-                rpn_rois[:, 4] = np.clip(rpn_rois[:, 4], 0, W)  # x2
-                rpn_rois[:, 5] = np.clip(rpn_rois[:, 5], 0, D)  # z2
-                valid = (rpn_rois[:, 3] > rpn_rois[:, 0]) & (rpn_rois[:, 4] > rpn_rois[:, 1]) & (
-                            rpn_rois[:, 5] > rpn_rois[:, 2])
+                rpn_rois[:, 0] = np.clip(rpn_rois[:, 0], 0, H)
+                rpn_rois[:, 1] = np.clip(rpn_rois[:, 1], 0, W)
+                rpn_rois[:, 2] = np.clip(rpn_rois[:, 2], 0, D)
+                rpn_rois[:, 3] = np.clip(rpn_rois[:, 3], 1, H)
+                rpn_rois[:, 4] = np.clip(rpn_rois[:, 4], 1, W)
+                rpn_rois[:, 5] = np.clip(rpn_rois[:, 5], 1, D)
+
+                valid = ((rpn_rois[:, 3] > rpn_rois[:, 0]) &
+                         (rpn_rois[:, 4] > rpn_rois[:, 1]) &
+                         (rpn_rois[:, 5] > rpn_rois[:, 2]))
                 rpn_rois = rpn_rois[valid]
+
                 if rpn_rois.shape[0] == 0:
                     class_loss.append(rpn_class_loss[m])
                     bbox_loss.append(rpn_bbox_loss[m])
                     continue
 
+                # Телеметрия
                 try:
                     Telemetry.update_rpn_proposals(rpn_rois, boxes, config)
                 except Exception:
                     pass
 
-                overlaps = compute_overlaps(boxes, rpn_rois)
-                TOPK_LIST = list(getattr(config, "EVAL_TOPK_GRID", [int(getattr(config, "EVAL_TOPK_RPN", 512))]))
+                # Вычисление IoU между GT boxes и RPN proposals
+                overlaps = compute_overlaps(boxes, rpn_rois)  # [G x R]
+
+                # Detection@IoU по разным topK
+                TOPK_LIST = list(getattr(config, "EVAL_TOPK_GRID", [topk]))
                 try:
                     for K in TOPK_LIST:
                         rpn_rois_k = denorm_boxes(batch_rpn_rois[m, :int(K)], config.IMAGE_SHAPE[:3])
                         if rpn_rois_k is None or rpn_rois_k.shape[0] == 0:
                             continue
-                        H, W, D = config.IMAGE_SHAPE[:3]
-                        rpn_rois_k[:, 0] = np.clip(rpn_rois_k[:, 0], 0, H);
-                        rpn_rois_k[:, 1] = np.clip(rpn_rois_k[:, 1], 0, W);
+
+                        rpn_rois_k[:, 0] = np.clip(rpn_rois_k[:, 0], 0, H)
+                        rpn_rois_k[:, 1] = np.clip(rpn_rois_k[:, 1], 0, W)
                         rpn_rois_k[:, 2] = np.clip(rpn_rois_k[:, 2], 0, D)
-                        rpn_rois_k[:, 3] = np.clip(rpn_rois_k[:, 3], 0, H);
-                        rpn_rois_k[:, 4] = np.clip(rpn_rois_k[:, 4], 0, W);
-                        rpn_rois_k[:, 5] = np.clip(rpn_rois_k[:, 5], 0, D)
-                        valid_k = (rpn_rois_k[:, 3] > rpn_rois_k[:, 0]) & (rpn_rois_k[:, 4] > rpn_rois_k[:, 1]) & (
-                                    rpn_rois_k[:, 5] > rpn_rois_k[:, 2])
+                        rpn_rois_k[:, 3] = np.clip(rpn_rois_k[:, 3], 1, H)
+                        rpn_rois_k[:, 4] = np.clip(rpn_rois_k[:, 4], 1, W)
+                        rpn_rois_k[:, 5] = np.clip(rpn_rois_k[:, 5], 1, D)
+
+                        valid_k = ((rpn_rois_k[:, 3] > rpn_rois_k[:, 0]) &
+                                   (rpn_rois_k[:, 4] > rpn_rois_k[:, 1]) &
+                                   (rpn_rois_k[:, 5] > rpn_rois_k[:, 2]))
                         rpn_rois_k = rpn_rois_k[valid_k]
+
                         if rpn_rois_k.shape[0] == 0:
                             continue
 
@@ -1100,40 +1349,47 @@ def rpn_evaluation(model, config, subsets, datasets, check_boxes):
                             det_at[subset_key].setdefault(f"{thr:.2f}@{int(K)}", []).append(
                                 100.0 * float(hits) / max(1, boxes.shape[0])
                             )
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[rpn_eval] topk_grid error: {e}")
 
+                # Matching boxes<->rois с правильной логикой
                 roi_association = -1 * np.ones(boxes.shape[0], dtype=np.int32)
                 box_association = -1 * np.ones(rpn_rois.shape[0], dtype=np.int32)
+
                 for j in range(rpn_rois.shape[0]):
                     roi_overlaps = overlaps[:, j]
-
                     argmax = np.argmax(roi_overlaps)
+
                     if roi_association[argmax] == -1:
                         if roi_overlaps[argmax] > IOU_THRESH:
                             roi_association[argmax] = j
                             box_association[j] = argmax
 
-                roi_association = [i for i in roi_association if i != -1]
-                if len(roi_association) == 0:
+                # Собираем matched пары
+                matched_pairs = []
+                for gt_idx in range(boxes.shape[0]):
+                    if roi_association[gt_idx] != -1:
+                        matched_pairs.append((gt_idx, roi_association[gt_idx]))
+
+                if len(matched_pairs) == 0:
                     detection_scores.append(0.0)
                     class_loss.append(rpn_class_loss[m])
                     bbox_loss.append(rpn_bbox_loss[m])
                     continue
 
-                box_association = [indice for indice in box_association if indice != -1]
-                box_association.sort()
+                gt_indices = [pair[0] for pair in matched_pairs]
+                roi_indices = [pair[1] for pair in matched_pairs]
 
-                positive_rois = rpn_rois[roi_association]
-                positive_boxes = boxes[box_association]
+                positive_boxes = boxes[gt_indices]
+                positive_rois = rpn_rois[roi_indices]
 
                 if check_boxes and checked < 10:
-                    print("Pred:", positive_rois)
                     print("GT:", positive_boxes)
+                    print("Pred:", positive_rois)
                     checked += 1
 
                 bbox_errors.append(float(np.mean(np.abs(positive_rois - positive_boxes))))
-                detection_scores.append(100.0 * positive_rois.shape[0] / max(1, boxes.shape[0]))
+                detection_scores.append(100.0 * len(matched_pairs) / max(1, boxes.shape[0]))
 
                 class_loss.append(rpn_class_loss[m])
                 bbox_loss.append(rpn_bbox_loss[m])
@@ -1145,10 +1401,11 @@ def rpn_evaluation(model, config, subsets, datasets, check_boxes):
         mean_bbox_error = float(np.mean(bbox_errors)) if len(bbox_errors) else 0.0
         mean_detection_score = float(np.mean(detection_scores)) if len(detection_scores) else 0.0
 
-        print("CLASS:", mean_class_loss, "+/-", std_class_loss, 
+        print("CLASS:", mean_class_loss, "+/-", std_class_loss,
               "BBOX:", mean_bbox_loss, "+/-", std_bbox_loss)
-        print("Mean Coordinate Error:", mean_bbox_error, 
+        print("Mean Coordinate Error:", mean_bbox_error,
               "Detection score:", mean_detection_score)
+
         try:
             for thr_str, values in det_at[subset_key].items():
                 if values:
@@ -1200,36 +1457,87 @@ def head_evaluation(model, config, subsets, datasets):
 # In the long run, it's more efficient to modify the code to support large
 # batches and getting rid of this function. Consider this a temporary solution
 def batch_slice(inputs, graph_fn, batch_size, names=None):
-    """Splits inputs into slices and feeds each slice to a copy of the given
-    computation graph and then combines the results. It allows you to run a
-    graph on a batch of inputs even if the graph is written to support one
-    instance only.
+    """
+    Splits inputs into slices and feeds each slice to a copy of the given
+    computation graph and then combines the results.
+
+    ФИНАЛЬНОЕ РЕШЕНИЕ с безопасным доступом к элементам.
 
     inputs: list of tensors. All must have the same first dimension length
     graph_fn: A function that returns a TF tensor that's part of a graph.
     batch_size: number of slices to divide the data into.
     names: If provided, assigns names to the resulting tensors.
     """
+    import tensorflow as tf
+
     if not isinstance(inputs, list):
         inputs = [inputs]
 
-    outputs = []
-    for i in range(batch_size):
-        inputs_slice = [x[i] for x in inputs]
-        output_slice = graph_fn(*inputs_slice)
-        if not isinstance(output_slice, (tuple, list)):
-            output_slice = [output_slice]
-        outputs.append(output_slice)
-    # Change outputs from a list of slices where each is
-    # a list of outputs to a list of outputs and each has
-    # a list of slices
-    outputs = list(zip(*outputs))
+    # Паддим все входы до batch_size
+    padded_inputs = []
+    for inp in inputs:
+        current_size = tf.shape(inp)[0]
+        pad_size = tf.maximum(0, batch_size - current_size)
+
+        # Получаем форму для паддинга
+        inp_shape = tf.shape(inp)
+        pad_shape = tf.concat([[pad_size], inp_shape[1:]], axis=0)
+        padding = tf.zeros(pad_shape, dtype=inp.dtype)
+
+        # Конкатенируем и обрезаем
+        padded = tf.concat([inp, padding], axis=0)[:batch_size]
+        padded_inputs.append(padded)
+
+    # Создаем маску валидности (какие элементы реальные, а какие паддинг)
+    actual_batch_size = tf.shape(inputs[0])[0]
+    indices = tf.range(batch_size)
+    valid_mask = tf.less(indices, actual_batch_size)
+
+    # Обрабатываем первый элемент для получения структуры
+    inputs_slice_0 = [inp[0] for inp in padded_inputs]
+    output_slice_0 = graph_fn(*inputs_slice_0)
+
+    if not isinstance(output_slice_0, (tuple, list)):
+        output_slice_0 = [output_slice_0]
+    elif isinstance(output_slice_0, tuple):
+        output_slice_0 = list(output_slice_0)
+
+    # Создаем шаблоны нулевых выходов
+    zero_outputs = [tf.zeros_like(out) for out in output_slice_0]
+
+    # Функция для обработки одного элемента
+    def process_single(i):
+        """Обрабатываем i-й элемент батча"""
+        inputs_slice = [tf.gather(inp, i) for inp in padded_inputs]
+
+        # Проверяем валидность
+        is_valid = tf.gather(valid_mask, i)
+
+        def real_process():
+            result = graph_fn(*inputs_slice)
+            if not isinstance(result, (tuple, list)):
+                result = [result]
+            elif isinstance(result, tuple):
+                result = list(result)
+            return result
+
+        def zero_process():
+            return zero_outputs
+
+        return tf.cond(is_valid, real_process, zero_process)
+
+    # Обрабатываем все элементы
+    all_outputs = [process_single(i) for i in range(batch_size)]
+
+    # Транспонируем структуру: из списка кортежей в кортеж списков
+    outputs = list(zip(*all_outputs))
 
     if names is None:
         names = [None] * len(outputs)
 
     result = [tf.stack(o, axis=0, name=n)
               for o, n in zip(outputs, names)]
+
     if len(result) == 1:
         result = result[0]
 
@@ -1237,38 +1545,33 @@ def batch_slice(inputs, graph_fn, batch_size, names=None):
 
 
 def norm_boxes(boxes, shape):
-    """Converts boxes from pixel coordinates to normalized coordinates.
-    boxes: [N, (y1, x1, y2, x2)] in pixel coordinates
-    shape: [..., (height, width)] in pixels
-
-    Note: In pixel coordinates (y2, x2) is outside the box. But in normalized
-    coordinates it's inside the box.
-
-    Returns:
-        [N, (y1, x1, y2, x2)] in normalized coordinates
     """
-    h, w, d = shape
-    scale = np.array([h - 1, w - 1, d - 1, h - 1, w - 1, d - 1])
-    shift = np.array([0, 0, 0, 1, 1, 1])
-    return np.divide((boxes - shift), scale).astype(np.float32)
+    Нормализует боксы из пикселей в [0,1].
+    boxes: [N, (y1, x1, z1, y2, x2, z2)] в пикселях
+    shape: (H, W, D) размер изображения
+
+    Returns: [N, (y1, x1, z1, y2, x2, z2)] нормализованные [0,1]
+    """
+    h, w, d = int(shape[0]), int(shape[1]), int(shape[2])
+    scale = np.array([h, w, d, h, w, d], dtype=np.float32)
+
+    # ✅ Простая нормализация без shift
+    return (boxes.astype(np.float32) / scale).astype(np.float32)
 
 
 def denorm_boxes(boxes, shape):
-    """Converts boxes from normalized coordinates to pixel coordinates.
-    boxes: [N, (y1, x1, y2, x2)] in normalized coordinates
-    shape: [..., (height, width)] in pixels
-
-    Note: In pixel coordinates (y2, x2) is outside the box. But in normalized
-    coordinates it's inside the box.
-
-    Returns:
-        [N, (y1, x1, y2, x2)] in pixel coordinates
     """
-    h, w, d = shape
-    scale = np.array([h - 1, w - 1, d - 1, h - 1, w - 1, d - 1])
-    shift = np.array([0, 0, 0, 1, 1, 1])
-    return np.around(np.multiply(boxes, scale) + shift).astype(np.int32)
+    Денормализует боксы из [0,1] в пиксели.
+    boxes: [N, (y1, x1, z1, y2, x2, z2)] нормализованные [0,1]
+    shape: (H, W, D) размер изображения в пикселях
 
+    Returns: [N, (y1, x1, z1, y2, x2, z2)] в пикселях (float32, НЕ округлённые!)
+    """
+    h, w, d = int(shape[0]), int(shape[1]), int(shape[2])
+    scale = np.array([h, w, d, h, w, d], dtype=np.float32)
+
+    # ✅ КРИТИЧНО: НЕ округляем! Оставляем float для точности IoU
+    return (boxes.astype(np.float32) * scale).astype(np.float32)
 
 def resize(image, output_shape, order=1, mode='constant', cval=0, clip=True,
            preserve_range=False, anti_aliasing=False, anti_aliasing_sigma=None):
@@ -1292,12 +1595,12 @@ def resize(image, output_shape, order=1, mode='constant', cval=0, clip=True,
             image, output_shape,
             order=order, mode=mode, cval=cval, clip=clip,
             preserve_range=preserve_range)
-import os, json, numpy as _np
+
 class Telemetry:
     """Ultra-light counters/histograms for anchor/IoU/proposal stats.
        Updates are probabilistically sampled to keep overhead negligible."""
     enabled: bool = True
-    sample: float = 0.02          # ~2% батчей обновляют телеметрию
+    sample: float = 0.05          # ~2% батчей обновляют телеметрию
     _cnt   = _dd(int)
     _hist  = _dd(list)
     _save_dir = None
@@ -1344,51 +1647,50 @@ class Telemetry:
     def _quantize_scales(vals, step=8, lo=8, hi=256, limit=8):
         xs = Telemetry._snap_vals(vals, step=step, lo=lo, hi=hi, ndigits=0)
         return xs[:limit]
+
     @staticmethod
     def update_rpn_targets(anchors, iou_max, match, config):
-        """Call inside build_rpn_targets after rpn_match computed.
-        anchors: [N,6] (y1,x1,z1,y2,x2,z2)
-        iou_max: [N] max IoU per anchor vs its best GT
-        match:   [N] {1=pos,0=neutral,-1=neg}
-        """
+        """Call inside build_rpn_targets after rpn_match computed."""
+        import numpy as _np
         if not getattr(config, "TELEMETRY", True): return
         if _np.random.rand() > float(getattr(config, "TELEMETRY_SAMPLE", Telemetry.sample)): return
+
         Telemetry._save_dir = getattr(config, "WEIGHT_DIR", Telemetry._save_dir)
         Telemetry._cnt['rpn_pos'] += int(_np.sum(match == 1))
         Telemetry._cnt['rpn_neg'] += int(_np.sum(match == -1))
         Telemetry._cnt['rpn_neu'] += int(_np.sum(match == 0))
 
-        # немного IoU в гистограмму (обрезаем до 256 значений)
-        mm = (match == 1) | (match == -1)
-        if _np.any(mm):
-            vals = iou_max[mm][:256]
-            Telemetry._hist['rpn_iou_max'].extend([float(v) for v in vals])
+        # ИСПРАВЛЕНИЕ: берём IoU ТОЛЬКО от позитивов (не нейтралов/негативов!)
+        pos_mask = (match == 1)
+        if _np.any(pos_mask):
+            vals = iou_max[pos_mask]  # ТОЛЬКО ПОЗИТИВЫ!
+            # Фильтруем слишком малые значения (артефакты)
+            vals = vals[vals > 0.05]  # порог 0.05 для фильтрации шума
+            if vals.size > 0:
+                # Семплируем до 256 для экономии памяти
+                if vals.size > 256:
+                    idx = _np.random.choice(vals.size, 256, replace=False)
+                    vals = vals[idx]
+                Telemetry._hist['rpn_iou_max'].extend([float(v) for v in vals])
 
-        # быстрые геометрические сводки по ПОЛОЖИТЕЛЬНЫМ якорям
+        # Геометрия позитивных якорей (как было)
         pos_idx = _np.where(match == 1)[0]
-        if pos_idx.size:
-            # Сэмплируем до 256 позитивов
+        if pos_idx.size > 0:
             if pos_idx.size > 256:
                 pos_idx = _np.random.choice(pos_idx, 256, replace=False)
-
             a = anchors[pos_idx]
             dy = a[:, 3] - a[:, 0]
             dx = a[:, 4] - a[:, 1]
             dz = a[:, 5] - a[:, 2]
-
-            xy_geom = _np.sqrt(_np.maximum(1.0, dy * dx))  # proxy масштаба XY
+            xy_geom = _np.sqrt(_np.maximum(1.0, dy * dx))
             Telemetry._hist['pos_dz'].extend([float(v) for v in dz])
             Telemetry._hist['pos_xy'].extend([float(v) for v in xy_geom])
 
-            # Привязка к ближайшему scale/ratio из конфига (грубая, но быстрая)
             scales = _np.array(getattr(config, "RPN_ANCHOR_SCALES", [32, 64, 96, 128, 160]), dtype=_np.float32)
             ratios = _np.array(getattr(config, "RPN_ANCHOR_RATIOS", [0.1, 0.2, 0.3]), dtype=_np.float32)
-
-            # Оцениваем "масштаб" как ближайший scale к XY-размеру, ratio ~ dz / chosen_scale
             s_idx = _np.argmin(_np.abs(xy_geom[:, None] - scales[None, :]), axis=1)
             est_ratio = dz / _np.maximum(1.0, scales[s_idx])
             r_idx = _np.argmin(_np.abs(est_ratio[:, None] - ratios[None, :]), axis=1)
-
             for v in scales[s_idx]:
                 Telemetry._cnt[f"pos_scale_{int(v)}"] += 1
             for v in ratios[r_idx]:
@@ -1493,138 +1795,163 @@ class Telemetry:
         return s
 
     @staticmethod
-    def snapshot_and_reset(epoch, save_dir, extra=None):
-        """Сериализуем jsonl + печатаем дайджест с подсказками для конфигов.
-           Не требует config, использует безопасные дефолты.
-        """
-        import os, json, numpy as _np
+    def snapshot_and_reset(epoch, save_dir=None, extra=None):
+        """Снимок телеметрии + подсказки scales/ratios в JSONL. Абсолютно безопасно к типам/ошибкам."""
+        import os, json
+        import numpy as _np
+        def _py(x):
+            # Преобразуем всё потенциально «не-JSON-овое» в питоновские типы
+            try:
+
+                if isinstance(x, (_np.integer, _np.floating)):
+                    return float(x)
+                if isinstance(x, _np.ndarray):
+                    # режем длину, чтобы не распухал jsonl
+                    return [float(v) for v in x.reshape(-1).tolist()[:32]]
+            except Exception:
+                pass
+            if isinstance(x, (bytes, bytearray)):
+                try:
+                    return x.decode("utf-8", "ignore")
+                except Exception:
+                    return str(x)
+            if isinstance(x, (dict, list, tuple)):
+                try:
+                    # рекурсивная очистка
+                    if isinstance(x, dict):
+                        return {str(k): _py(v) for k, v in x.items()}
+                    else:
+                        return [_py(v) for v in x]
+                except Exception:
+                    return str(x)
+            return x
 
         # --- подготовка снимка ---
         snap = {
             "epoch": int(epoch),
-            "cnt": dict(Telemetry._cnt),
+            "cnt": {str(k): int(v) for k, v in Telemetry._cnt.items()},
             "hist": {k: Telemetry._percentiles(v) for k, v in Telemetry._hist.items()},
         }
         if isinstance(extra, dict):
-            snap["extra"] = {k: float(v) if isinstance(v, (int, float)) else v for k, v in extra.items()}
+            snap["extra"] = {str(k): _py(v) for k, v in extra.items()}
 
-        # если не передали save_dir — возьмём то, что сохранилось ранее
         if not save_dir:
             save_dir = Telemetry._save_dir or "./weights"
+        os.makedirs(save_dir, exist_ok=True)
 
-        # --- top по scales/ratios ---
+        # --- top по scales/ratios из счётчиков, «привязанных к конфигу» ---
         cnt = snap["cnt"]
         scale_items = [(k, v) for k, v in cnt.items() if k.startswith("pos_scale_")]
         ratio_items = [(k, v) for k, v in cnt.items() if k.startswith("pos_ratio_")]
 
-        def _top3(items, key_is_num=False):
+        def _topN(items, key_is_scale=False, N=10):
             if not items:
                 return []
-            if key_is_num:
-                items = [(int(k.split("pos_scale_")[1]), v) for k, v in items]
+            if key_is_scale:
+                items = [(int(k.split("pos_scale_")[1]), int(v)) for k, v in items]
             else:
-                items = [(float(k.split("pos_ratio_")[1]), v) for k, v in items]
+                items = [(float(k.split("pos_ratio_")[1]), int(v)) for k, v in items]
             items.sort(key=lambda kv: (-kv[1], kv[0]))
-            return items[:3]
+            return items[:N]
 
-        top_scales = _top3(scale_items, key_is_num=True)
-        top_ratios = _top3(ratio_items, key_is_num=False)
+        top_scales = _topN(scale_items, key_is_scale=True, N=10)
+        top_ratios = _topN(ratio_items, key_is_scale=False, N=10)
         snap["top"] = {
             "scales": [{"value": int(s), "count": int(c)} for s, c in top_scales],
             "ratios": [{"value": float(r), "count": int(c)} for r, c in top_ratios],
         }
 
-        # --- SUGGEST: готовые списки для конфига ---
-        # Диапазоны/шаги — безопасные дефолты, чтобы не зависеть от config внутри статики.
-        SCALE_STEP = 8
+        # --- SUGGEST: готовые списки для конфига (квантизация по перцентилям) ---
+        SCALE_STEP = float(getattr(Telemetry, "SCALE_STEP", 8))
         SCALE_MIN, SCALE_MAX_DEFAULT = 8, 256
-        RATIO_STEP = 0.02
+        RATIO_STEP = float(getattr(Telemetry, "RATIO_STEP", 0.02))
         RATIO_MIN, RATIO_MAX = 0.04, 0.30
         LIMIT = 8
 
+        # XY → scales
         xy_vals = []
         for key in ("gt_xy", "pos_xy", "roi_xy"):
-            h = snap["hist"].get(key)
-            if h and "p50" in h:
-                xy_vals += [h.get("p25", 0), h.get("p50", 0), h.get("p75", 0)]
+            h = snap["hist"].get(key, {})
+            if "p50" in h:
+                xy_vals += [h.get("p25", 0.0), h.get("p50", 0.0), h.get("p75", 0.0)]
         hi_xy = int(max(SCALE_MAX_DEFAULT, snap["hist"].get("roi_xy", {}).get("max", SCALE_MAX_DEFAULT)))
         scales_suggest = Telemetry._quantize_scales(xy_vals, step=SCALE_STEP, lo=SCALE_MIN, hi=hi_xy)[:LIMIT]
 
-        rat_src = []
-        hrat = snap["hist"].get("gt_ratio_est")
-        if hrat:
-            rat_src += [hrat.get("p25", 0), hrat.get("p50", 0), hrat.get("p75", 0)]
-        pd, px = snap["hist"].get("pos_dz"), snap["hist"].get("pos_xy")
-        if pd and px:
-            for dz, xy in ((pd.get("p25", 0), px.get("p25", 1)),
-                           (pd.get("p50", 0), px.get("p50", 1)),
-                           (pd.get("p75", 0), px.get("p75", 1))):
-                if xy > 0:
-                    rat_src.append(float(dz) / float(xy))
-        # добавим пики из top_ratios
-        rat_src += [float(r) for r, _cnt in top_ratios]
-        # защёлкиваем к сетке
-        ratios_suggest = Telemetry._snap_vals(rat_src, step=RATIO_STEP, lo=RATIO_MIN, hi=RATIO_MAX, ndigits=3)[:LIMIT]
+        # Ratio → ratios
+        gt_rat = snap["hist"].get("gt_ratio_est", {})
+        roi_xy = snap["hist"].get("roi_xy", {})
+        roi_dz = snap["hist"].get("roi_dz", {})
 
-        snap["suggest"] = {"scales": scales_suggest, "ratios": ratios_suggest}
+        est_candidates = []
+        # 1) Берём gt_ratio_est p25/p50/p75, если есть
+        for k in ("p25", "p50", "p75"):
+            if k in gt_rat:
+                est_candidates.append(float(gt_rat[k]))
+        # 2) Если есть ROI-оценки xy и dz, строим dz/xy по тем же перцентилям
+        if all(k in roi_xy for k in ("p25", "p50", "p75")) and all(k in roi_dz for k in ("p25", "p50", "p75")):
+            for k in ("p25", "p50", "p75"):
+                denom = max(1e-6, float(roi_xy[k]))
+                est_candidates.append(float(roi_dz[k]) / denom)
 
-        # сохраним последний suggest в классе — для AutoTuneRPNCallback
+        # Фильтрация/квантизация
+        def _snap_ratio(vals, step=RATIO_STEP, lo=RATIO_MIN, hi=RATIO_MAX, limit=LIMIT):
+            return Telemetry._snap_vals(vals, step=step, lo=lo, hi=hi, ndigits=3)[:limit]
+
+        ratios_suggest = _snap_ratio(est_candidates, step=RATIO_STEP, lo=RATIO_MIN, hi=RATIO_MAX, limit=LIMIT)
+
+        snap["suggest"] = {
+            "scales": [int(s) for s in scales_suggest],
+            "ratios": [float(r) for r in ratios_suggest],
+        }
+
+        # --- запись JSONL (атомарно и без падений)
         try:
-            Telemetry._last_suggest = {"RPN_ANCHOR_SCALES": scales_suggest, "RPN_ANCHOR_RATIOS": ratios_suggest}
-        except Exception:
-            pass
-
-        # --- запись jsonl ---
-        try:
-            os.makedirs(save_dir, exist_ok=True)
-            with open(os.path.join(save_dir, "telemetry.jsonl"), "a", encoding="utf-8") as f:
-                f.write(json.dumps(snap, ensure_ascii=False) + "\n")
-        except Exception:
-            pass
-
-        # --- краткий принт + эвристики ---
-        pos = snap["cnt"].get("rpn_pos", 0);
-        neg = snap["cnt"].get("rpn_neg", 0);
-        neu = snap["cnt"].get("rpn_neu", 0)
-        iou_p50 = snap["hist"].get("rpn_iou_max", {}).get("p50", None)
-
-        def _fmt_top(name, arr):
-            if not arr:
-                return f"{name}=-"
-            return f"{name}=" + ",".join([f"{v['value']}({v['count']})" for v in arr])
-        print(f"[telemetry] epoch={snap['epoch']} "
-            f"rpn(+/0/-)={pos}/{neu}/{neg}  iou50={iou_p50 if iou_p50 is not None else '-'}  "
-            f"hits={snap['cnt'].get('prop_hits', 0)}/{snap['cnt'].get('prop_total', 0)}  "
-            f"{_fmt_top('top_scales', snap['top']['scales'])}  {_fmt_top('top_ratios', snap['top']['ratios'])}")
-
-        if snap.get("suggest"):
-            print(
-                    f"[telemetry] suggest_scales={snap['suggest']['scales']}  suggest_ratios={snap['suggest']['ratios']}")
-
-                # опционально сохраним патч с подсказками рядом с весами
-
-        try:
-            ds = os.path.basename(os.path.normpath(save_dir.rstrip("/"))) or "dataset"
-            patch = {"RPN_ANCHOR_SCALES": scales_suggest, "RPN_ANCHOR_RATIOS": ratios_suggest}
-            with open(os.path.join(save_dir, f"suggest_patch_{ds}_epoch{snap['epoch']:03d}.json"), "w",
-                      encoding="utf-8") as pf:
-                pf.write(json.dumps(patch, ensure_ascii=False, indent=2))
+            path = os.path.join(save_dir, "telemetry.jsonl")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(_py(snap), ensure_ascii=False) + "\n")
         except Exception as e:
-            print(f"[telemetry] save suggest patch failed: {e}")
+            # Логируем, но не мешаем обучению
+            print(f"[Telemetry] write failed: {e}")
 
+        # Сброс счётчиков
         Telemetry.reset()
 
     @staticmethod
     def _percentiles(arr):
         if not arr: return {}
-        a = _np.asarray(arr, dtype=_np.float32)
+        a = np.asarray(arr, dtype=np.float32)  # ← ИЗМЕНЕНО: _np → np
         return {
             "count": int(a.size),
-            "min":   float(a.min()),
-            "p25":   float(_np.percentile(a, 25)),
-            "p50":   float(_np.percentile(a, 50)),
-            "p75":   float(_np.percentile(a, 75)),
-            "max":   float(a.max()),
+            "min": float(a.min()),
+            "p25": float(np.percentile(a, 25)),  # ← ИЗМЕНЕНО: _np → np
+            "p50": float(np.percentile(a, 50)),  # ← ИЗМЕНЕНО: _np → np
+            "p75": float(np.percentile(a, 75)),  # ← ИЗМЕНЕНО: _np → np
+            "max": float(a.max()),
             "mean": float(a.mean()),
             "std": float(a.std())
         }
+
+    @staticmethod
+    def log_config_params(config):
+        """Логирует ключевые параметры конфига для анализа."""
+        params = {
+            "IMAGE_SHAPE": tuple(getattr(config, "IMAGE_SHAPE", (0, 0, 0))),
+            "RPN_ANCHOR_SCALES": list(getattr(config, "RPN_ANCHOR_SCALES", [])),
+            "RPN_ANCHOR_RATIOS": list(getattr(config, "RPN_ANCHOR_RATIOS", [])),
+            "RPN_BBOX_STD_DEV": list(getattr(config, "RPN_BBOX_STD_DEV", [])),
+            "BBOX_STD_DEV": list(getattr(config, "BBOX_STD_DEV", [])),
+            "RPN_POSITIVE_IOU": float(getattr(config, "RPN_POSITIVE_IOU", 0.0)),
+            "RPN_NEGATIVE_IOU": float(getattr(config, "RPN_NEGATIVE_IOU", 0.0)),
+            "VOXEL_Z_OVER_Y": float(getattr(config, "VOXEL_Z_OVER_Y", 0.0)),
+            "RPN_TRAIN_ANCHORS_PER_IMAGE": int(getattr(config, "RPN_TRAIN_ANCHORS_PER_IMAGE", 0)),
+            "PRE_NMS_LIMIT": int(getattr(config, "PRE_NMS_LIMIT", 0)),
+            "POST_NMS_ROIS_TRAINING": int(getattr(config, "POST_NMS_ROIS_TRAINING", 0)),
+            "ANCHOR_NB": int(getattr(config, "ANCHOR_NB", 0)),
+        }
+        print("\n" + "=" * 60)
+        print("CONFIG PARAMETERS:")
+        print("=" * 60)
+        for k, v in params.items():
+            print(f"  {k}: {v}")
+        print("=" * 60 + "\n")
+        return params

@@ -25,7 +25,7 @@ class Config(object):
         IMAGE_CHANNEL_COUNT = 1,
         MAX_GT_INSTANCES = 50,
         TARGET_RATIO = 0.2,
-        USE_MINI_MASK = True,
+        USE_MINI_MASK = False,
         MINI_MASK_SHAPE = (56, 56, 56),
         RPN_BBOX_STD_DEV = [0.1, 0.1, 0.1, 0.2, 0.2, 0.2],
         BBOX_STD_DEV = [0.1, 0.1, 0.1, 0.2, 0.2, 0.2],
@@ -48,17 +48,20 @@ class Config(object):
         POST_NMS_ROIS_TRAINING = 3000,
         POST_NMS_ROIS_INFERENCE = 1500,
 
-        # Head
+
+    # Head
         TRAIN_ROIS_PER_IMAGE = 512,
         ROI_POSITIVE_RATIO = 0.33,
         POOL_SIZE = 7, 
         MASK_POOL_SIZE = 14,
         FPN_CLASSIF_FC_LAYERS_SIZE = 1024, 
         HEAD_CONV_CHANNEL = 256,
+        HEAD_MAX_ROIS = 1000,
         MASK_SHAPE = [28, 28, 28], 
         TELEMETRY=True,
         TELEMETRY_SAMPLE=0.02,
         EVAL_DET_IOU=0.4,
+        MIN_ROI_SIZE=15, # in pixels
         # Detection
         DETECTION_MAX_INSTANCES = 50,
         DETECTION_MIN_CONFIDENCE = 0.2,
@@ -84,6 +87,7 @@ class Config(object):
         EVAL_MATCH_IOU_GRID = [0.30, 0.40, 0.50],
         EVAL_TOPK_GRID = [500, 1000, 2000, 4000, 6000, 8000],
 
+
         AUTO_TUNE_RPN=False,
         AUTO_TUNE_SAVE_PATCH=True,
         AUTO_TUNE_SNAP_SCALE_STEP=8,
@@ -91,6 +95,8 @@ class Config(object):
         AUTO_TUNE_RATIO_RANGE=[0.04, 0.30],
         AUTO_TUNE_SCALES_LIMIT=8,
         AUTO_TUNE_RATIOS_LIMIT=8,
+
+        MIN_POSITIVE_TARGETS=25,
 
         AUGMENT= True,
         AUG_PROB=0.5,
@@ -106,7 +112,7 @@ class Config(object):
         ATSS_TOPK=12,
         ATSS_MIN_POS_PER_GT=3,
         RPN_GT_JITTER_IOU_THR=0.4,
-
+        VOXEL_Z_OVER_Y=1.0,
         HEAD_SHUFFLE_ROIS=False,
         HEAD_BALANCE_POS=False,
         HEAD_POS_FRAC=0.25
@@ -116,6 +122,7 @@ class Config(object):
         ###########################################
         ###   Data parameters
         ###########################################
+
 
         # Path to ground truth data dirs
         # In RPN targeting mode, represent the save path of head target generation
@@ -150,14 +157,14 @@ class Config(object):
         # Bounding box refinement standard deviation for RPN and final detections.
         self.RPN_BBOX_STD_DEV = np.asarray(RPN_BBOX_STD_DEV)
         self.BBOX_STD_DEV = np.asarray(BBOX_STD_DEV)
-
+        self.MIN_ROI_SIZE=MIN_ROI_SIZE
         # Number of example used in quick evaluation between epochs (see Callbacks in models.py)
         self.EVALUATION_STEPS = EVALUATION_STEPS
 
         # Output path for RPN targeting or Mask inference / evaluation
         self.OUTPUT_DIR = OUTPUT_DIR
 
-
+        self.MIN_POSITIVE_TARGETS=MIN_POSITIVE_TARGETS
         ###########################################
         ###   General structural parameters
         ###########################################
@@ -167,7 +174,7 @@ class Config(object):
         # Head mode is "training"
         # Mask R-CNN mode either "training" or "inference" for resp. train and evaluation / prediction
         self.MODE = MODE
-
+        self.VOXEL_Z_OVER_Y=VOXEL_Z_OVER_Y
 
         ###########################################
         ###   RPN and anchor system parameters
@@ -255,7 +262,7 @@ class Config(object):
 
         # Feature channel number used in the segmentation module
         self.HEAD_CONV_CHANNEL = HEAD_CONV_CHANNEL
-        
+        self.HEAD_MAX_ROIS=HEAD_MAX_ROIS
         # Shape of output mask
         # To change this you also need to change the neural network mask branch
         self.MASK_SHAPE = MASK_SHAPE
