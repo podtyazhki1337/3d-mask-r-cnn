@@ -1678,7 +1678,7 @@ def mrcnn_class_loss_graph(target_class_ids, pred_class_logits, active_class_ids
     FOCAL LOSS с диагностикой качества ROI.
     - универсальный подсчёт fg_prob (по истинному классу, не предполагает C=2)
     - доп. метрики: top1_acc по позитивам и по фону
-    - alpha/gamma можно вынести в config: CLASS_FOCAL_ALPHA, CLASS_FOCAL_GAMMA
+    - ✅ PENALTY за уверенные false positives (фон предсказан как объект)
     """
     import tensorflow as tf
     from tensorflow.keras import backend as K
@@ -1708,15 +1708,14 @@ def mrcnn_class_loss_graph(target_class_ids, pred_class_logits, active_class_ids
     probs = tf.nn.softmax(logits, axis=-1)
     probs_flat = tf.reshape(probs, [B * T, C])
     target_onehot = tf.one_hot(target_flat, C, dtype=tf.float32)
-    pt = tf.reduce_sum(probs_flat * target_onehot, axis=-1)           # p(true class)
+    pt = tf.reduce_sum(probs_flat * target_onehot, axis=-1)  # p(true class)
     pt = tf.clip_by_value(pt, K.epsilon(), 1.0 - K.epsilon())
 
-    gamma = tf.cast(getattr(__import__('builtins'), 'CLASS_FOCAL_GAMMA', 2.0), tf.float32)
-    alpha = tf.cast(getattr(__import__('builtins'), 'CLASS_FOCAL_ALPHA', 0.75), tf.float32)
+    gamma = tf.cast(getattr(__import__('builtins'), 'CLASS_FOCAL_GAMMA', 3.0), tf.float32)
+    alpha = tf.cast(getattr(__import__('builtins'), 'CLASS_FOCAL_ALPHA', 0.85), tf.float32)
 
     focal_weight = tf.pow(1.0 - pt, gamma)
     ce = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=target_flat, logits=logits_flat)
-    # без жёсткого клипа CE — оставим как есть для корректных градиентов
     focal_loss = focal_weight * ce
 
     # alpha-balancing по fg/bg
@@ -1724,6 +1723,27 @@ def mrcnn_class_loss_graph(target_class_ids, pred_class_logits, active_class_ids
     is_bg = 1.0 - is_fg
     class_weights = is_fg * alpha + is_bg * (1.0 - alpha)
 
+    # ✅ PENALTY ЗА УВЕРЕННЫЕ FALSE POSITIVES
+    # Максимальная вероятность среди НЕ-фоновых классов
+    fg_probs = probs_flat[:, 1:]  # [BT, C-1] - все классы кроме фона
+    max_fg_prob = tf.reduce_max(fg_probs, axis=-1)  # [BT] - макс вероятность объекта
+
+    # Штраф когда:
+    # 1. target = 0 (фон)
+    # 2. Модель уверенно предсказывает объект (max_fg_prob > 0.5)
+    fp_confidence_threshold = 0.5  # порог уверенности для penalty
+    fp_penalty_multiplier = 2.0  # коэффициент усиления loss
+
+    is_confident_fp = tf.cast(
+        (target_flat == 0) & (max_fg_prob > fp_confidence_threshold),
+        tf.float32
+    )
+
+    # Применяем penalty: умножаем loss на multiplier для confident FP
+    fp_penalty = 1.0 + is_confident_fp * (fp_penalty_multiplier - 1.0)
+    focal_loss = focal_loss * fp_penalty
+
+    # Применяем веса
     focal_loss = focal_loss * class_weights * tf.cast(true_active, focal_loss.dtype)
 
     # --- Диагностика ---
@@ -1733,20 +1753,32 @@ def mrcnn_class_loss_graph(target_class_ids, pred_class_logits, active_class_ids
     pos_count = tf.size(pos_ix)
     neg_count = tf.size(neg_ix)
 
-    # средняя вероятность истинного класса для позитивов (универсально, через pt)
+    # ✅ Добавляем диагностику confident FP
+    confident_fp_count = tf.reduce_sum(is_confident_fp)
+    mean_max_fg_prob_on_bg = tf.cond(
+        neg_count > 0,
+        lambda: tf.reduce_mean(tf.gather(max_fg_prob, neg_ix)),
+        lambda: tf.constant(0.0, tf.float32)
+    )
+
+    # средняя вероятность истинного класса для позитивов
     def _mean_fg_prob():
         return tf.reduce_mean(tf.gather(pt, pos_ix))
+
     mean_fg_prob = tf.cond(pos_count > 0, _mean_fg_prob, lambda: tf.constant(0.0, tf.float32))
 
     # top-1 accuracy по позитивам/фону
     pred_labels = tf.argmax(logits_flat, axis=-1, output_type=tf.int32)
+
     def _pos_acc():
         return tf.reduce_mean(tf.cast(tf.equal(tf.gather(pred_labels, pos_ix),
-                                              tf.gather(target_flat, pos_ix)), tf.float32))
+                                               tf.gather(target_flat, pos_ix)), tf.float32))
+
     pos_top1_acc = tf.cond(pos_count > 0, _pos_acc, lambda: tf.constant(0.0, tf.float32))
 
     def _bg_acc():
         return tf.reduce_mean(tf.cast(tf.equal(tf.gather(pred_labels, neg_ix), 0), tf.float32))
+
     bg_top1_acc = tf.cond(neg_count > 0, _bg_acc, lambda: tf.constant(0.0, tf.float32))
 
     loss_mean = tf.reduce_mean(focal_loss)
@@ -1762,8 +1794,9 @@ def mrcnn_class_loss_graph(target_class_ids, pred_class_logits, active_class_ids
         should_print,
         lambda: tf.compat.v1.Print(
             focal_loss,
-            [pos_count, neg_count, mean_fg_prob, pos_top1_acc, bg_top1_acc, loss_mean, loss_fg, loss_bg],
-            message="[CLASS_LOSS] pos/neg/fg_prob/pos_acc/bg_acc/loss_mean/loss_fg/loss_bg: "
+            [pos_count, neg_count, mean_fg_prob, pos_top1_acc, bg_top1_acc,
+             confident_fp_count, mean_max_fg_prob_on_bg, loss_mean, loss_fg, loss_bg],
+            message="[CLASS_LOSS] pos/neg/fg_prob/pos_acc/bg_acc/conf_fp/max_fg_on_bg/loss_mean/loss_fg/loss_bg: "
         ),
         lambda: focal_loss
     )
@@ -4789,8 +4822,8 @@ class HEAD():
 
         # ========== CALLBACKS ==========
         save_weights = BestAndLatestCheckpoint(save_path=self.config.WEIGHT_DIR, mode='HEAD')
-        early_stop = TF1EarlyStopping(monitor='val_loss', patience=10, verbose=1, restore_best_weights=True)
-        reduce_lr = TF1ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, verbose=1, min_lr=1e-7)
+        early_stop = TF1EarlyStopping(monitor='loss', patience=10, verbose=1, restore_best_weights=True)
+        reduce_lr = TF1ReduceLROnPlateau(monitor='loss', factor=0.5, patience=5, verbose=1, min_lr=1e-7)
         training_metrics = HeadTrainingMetricsCallback(
             self.keras_model,
             self.config,
@@ -6117,51 +6150,165 @@ class MaskRCNN():
                 float(dice_mean), float(dice_std), int(dice_n),
                 (roiN if roiN is not None else -1), (maxClsProb if maxClsProb is not None else -1)]
 
-
-
-
     def _pixelwise_metrics(self, pred_bin, gt_bin):
-        """Calculate pixelwise precision, recall, and F1 score."""
+        """Calculate pixelwise precision, recall, F1, and IoU."""
         tp = np.logical_and(pred_bin, gt_bin).sum(dtype=np.int64)
         fp = np.logical_and(pred_bin, np.logical_not(gt_bin)).sum(dtype=np.int64)
         fn = np.logical_and(np.logical_not(pred_bin), gt_bin).sum(dtype=np.int64)
+
         prec = (tp / (tp + fp + 1e-9)) if (tp + fp) > 0 else 0.0
         rec = (tp / (tp + fn + 1e-9)) if (tp + fn) > 0 else 0.0
         f1 = (2.0 * prec * rec / (prec + rec + 1e-9)) if (prec + rec) > 0 else 0.0
-        return float(prec), float(rec), float(f1)
+        iou = (tp / (tp + fp + fn + 1e-9)) if (tp + fp + fn) > 0 else 0.0
+
+        return float(prec), float(rec), float(f1), float(iou)
 
     def _instance_dice(self, pred_masks, gt_masks, iou_thr=0.5):
-        """Calculate instance-level DICE score with IoU-based matching."""
+        """Calculate instance-level DICE score with IoU-based matching + DETAILED LOGGING."""
         K = int(pred_masks.shape[-1]) if pred_masks is not None and pred_masks.ndim == 4 else 0
         G = int(gt_masks.shape[-1]) if gt_masks is not None and gt_masks.ndim == 4 else 0
+
         if K == 0 or G == 0:
+            print(f"[INSTANCE] No masks to match (K={K}, G={G})")
             return 0.0, 0.0, 0
-        P = pred_masks.reshape((-1, K)).astype(np.bool_)
-        T = gt_masks.reshape((-1, G)).astype(np.bool_)
+
+        pred_bin = (pred_masks > 0.5) if pred_masks.dtype != np.bool_ else pred_masks
+        gt_bin = (gt_masks > 0.5) if gt_masks.dtype != np.bool_ else gt_masks
+
+        P = pred_bin.reshape((-1, K)).astype(np.bool_)
+        T = gt_bin.reshape((-1, G)).astype(np.bool_)
+        print(f"[DEBUG RESHAPE]")
+        print(f"  pred_bin shape before reshape: {pred_bin.shape}")
+        print(f"  gt_bin shape before reshape: {gt_bin.shape}")
+        print(f"  P shape after reshape: {P.shape}")
+        print(f"  T shape after reshape: {T.shape}")
+        print(f"  P[:, 0] sum: {P[:, 0].sum()}")
+        print(f"  T[:, 0] sum: {T[:, 0].sum()}")
+        inter_test = np.logical_and(P[:, 0], T[:, 0]).sum()
+        print(f"  P[:, 0] AND T[:, 0]: {inter_test} pixels")
+        print(f"\n[AXIS DEBUG]")
+        print(f"  pred_masks shape: {pred_masks.shape}")
+        print(f"  gt_masks shape: {gt_masks.shape}")
+        print(f"  P reshaped: {P.shape}")
+        print(f"  T reshaped: {T.shape}")
+
+        # Проверяем есть ли вообще пересечение первых двух масок
+        if K > 0 and G > 0:
+            pred_0 = pred_masks[..., 0] > 0.5
+            gt_0 = gt_masks[..., 0] > 0.5
+            intersection = np.logical_and(pred_0, gt_0).sum()
+            print(f"  Direct test (pred#0 ∩ gt#0): {intersection} pixels")
+
+            if intersection == 0:
+                print(f"  ⚠️  NO INTERSECTION! Checking axis order...")
+                # Пробуем разные перестановки
+                for perm_name, perm in [("ZYX", (2, 0, 1)), ("XYZ", (1, 0, 2)), ("XZY", (1, 2, 0))]:
+                    try:
+                        gt_perm = np.transpose(gt_masks[..., 0], perm) > 0.5
+                        if gt_perm.shape != pred_0.shape:
+                            continue
+                        test_inter = np.logical_and(pred_0, gt_perm).sum()
+                        if test_inter > 0:
+                            print(f"    ✅ {test_inter} pixels with GT order: {perm_name} {perm}")
+                    except:
+                        pass
         P_sum = P.sum(axis=0).astype(np.int64)
         T_sum = T.sum(axis=0).astype(np.int64)
         inter = (P.T @ T).astype(np.int64)
         union = (P_sum[:, None] + T_sum[None, :]) - inter
+
         with np.errstate(divide='ignore', invalid='ignore'):
             iou = inter / np.maximum(union, 1)
+
+        # ✅ НОВОЕ: детальное логирование IoU матрицы
+        print(f"\n{'=' * 70}")
+        print(f"[INSTANCE MATCHING] Pred={K} masks, GT={G} masks, threshold={iou_thr}")
+        print(f"{'=' * 70}")
+
+        # Показываем лучшие IoU для каждой предсказанной маски
+        for k in range(min(K, 10)):
+            best_g = np.argmax(iou[k, :])
+            best_iou = iou[k, best_g]
+            above_thr = np.sum(iou[k, :] >= iou_thr)
+            status = "✅" if best_iou >= iou_thr else "❌"
+            print(f"  {status} Pred#{k}: best_IoU={best_iou:.3f} (GT#{best_g}), "
+                  f"size={P_sum[k]:>6}, matches_above_thr={above_thr}")
+
+        if K > 10:
+            print(f"  ... +{K - 10} more pred masks")
+
+        # Matching
         used_p = np.zeros((K,), dtype=np.bool_)
         used_g = np.zeros((G,), dtype=np.bool_)
         dices = []
+
+        print(f"\n[MATCHING PROCESS]")
+        iteration = 0
         while True:
             iou_mask = iou.copy()
             iou_mask[used_p, :] = -1.0
             iou_mask[:, used_g] = -1.0
             k, g = np.unravel_index(np.argmax(iou_mask), iou_mask.shape)
+
             if iou_mask[k, g] < iou_thr:
+                print(f"  Iter {iteration}: STOP (best remaining IoU={iou_mask[k, g]:.3f})")
                 break
+
             denom = P_sum[k] + T_sum[g]
             d = (2.0 * inter[k, g] / denom) if denom > 0 else 0.0
             dices.append(float(d))
+
+            print(f"  Iter {iteration}: pred#{k} ↔ GT#{g}, IoU={iou_mask[k, g]:.3f}, DICE={d:.3f}")
+
             used_p[k] = True
             used_g[g] = True
+            iteration += 1
+
+        # Итоги
+        unmatched_p = K - used_p.sum()
+        unmatched_g = G - used_g.sum()
+        print(f"\n[RESULT] Matched={len(dices)}, Unmatched_pred={unmatched_p}, Missed_GT={unmatched_g}")
+
         if len(dices) == 0:
+            print(f"⚠️  WARNING: NO MATCHES! Попробуйте снизить iou_thr (сейчас {iou_thr})")
+            print(f"{'=' * 70}\n")
             return 0.0, 0.0, 0
-        return float(np.mean(dices)), float(np.std(dices)), int(len(dices))
+
+        mean_dice = float(np.mean(dices))
+        std_dice = float(np.std(dices))
+        print(f"✅ Instance DICE: {mean_dice:.3f} ± {std_dice:.3f}")
+        print(f"{'=' * 70}\n")
+
+        return mean_dice, std_dice, int(len(dices))
+
+    def _print_metrics_summary(self, name, metrics):
+        """Печатает 4 ключевые метрики для каждого TIFF файла."""
+        print(f"\n{'=' * 70}")
+        print(f"📊 МЕТРИКИ: {name}.tiff")
+        print(f"{'=' * 70}")
+
+        # 1. Pixelwise
+        if 'pixelwise' in metrics:
+            prec, rec, f1, iou = metrics['pixelwise']
+            print(f"1️⃣  PIXELWISE")
+            print(f"   IoU:  {iou:.4f}")
+            print(f"   F1:   {f1:.4f}  (prec={prec:.3f}, rec={rec:.3f})")
+
+        # 2. Instance DICE
+        if 'instance_dice' in metrics:
+            mean_dice, std_dice, n_matched = metrics['instance_dice']
+            print(f"\n2️⃣  INSTANCE DICE")
+            print(f"   Mean: {mean_dice:.4f} ± {std_dice:.4f}  (n={n_matched} matches)")
+
+        # 3. Detection
+        if 'detection_performance' in metrics:
+            det = metrics['detection_performance']
+            print(f"\n3️⃣  DETECTION")
+            print(f"   F1:   {det.get('f1', 0):.4f}")
+            print(f"   Prec: {det.get('precision', 0):.4f}")
+            print(f"   Rec:  {det.get('recall', 0):.4f}")
+
+        print(f"{'=' * 70}\n")
 
     def save_classes_and_boxes(self, pd_class_ids, pd_boxes, name):
         import os
@@ -6195,7 +6342,12 @@ class MaskRCNN():
         from core.data_generators import MrcnnGenerator
 
         # === Вспомогательные функции ===
-
+        all_confidence_scores = []
+        confidence_histogram = {
+            '0.0-0.1': 0, '0.1-0.2': 0, '0.2-0.3': 0, '0.3-0.4': 0,
+            '0.4-0.5': 0, '0.5-0.6': 0, '0.6-0.7': 0, '0.7-0.8': 0,
+            '0.8-0.9': 0, '0.9-1.0': 0
+        }
         def _draw_masks_overlay(name, image, pd_masks, gt_masks, pd_boxes, gt_boxes,
                                 out_dir, pd_scores=None, metrics_dict=None):
             """Создаёт оверлей с МАСКАМИ (не боксами!) и метриками."""
@@ -6497,7 +6649,9 @@ class MaskRCNN():
             if pd_masks is not None and gt_masks is not None:
                 pd_bin = pd_masks.any(axis=-1) if pd_masks.ndim == 4 else pd_masks > 0
                 gt_bin = gt_masks.any(axis=-1) if gt_masks.ndim == 4 else gt_masks > 0
-                metrics['pixelwise'] = self._pixelwise_metrics(pd_bin, gt_bin)
+                prec, rec, f1, iou = self._pixelwise_metrics(pd_bin, gt_bin)
+                metrics['pixelwise'] = (prec, rec, f1, iou)
+                print(f"[PIXELWISE] IoU={iou:.4f}, F1={f1:.4f}, Prec={prec:.3f}, Rec={rec:.3f}")
 
                 # Instance DICE
                 metrics['instance_dice'] = self._instance_dice(pd_masks, gt_masks, iou_thr=0.5)
@@ -6694,7 +6848,38 @@ class MaskRCNN():
                               f"mean={np.mean(fg_probs):.4f} "
                               f"max={np.max(fg_probs):.4f} "
                               f"min={np.min(fg_probs):.4f}")
+                        all_confidence_scores.extend(fg_probs.tolist())
 
+                        for score in fg_probs:
+                            if score < 0.1:
+                                confidence_histogram['0.0-0.1'] += 1
+                            elif score < 0.2:
+                                confidence_histogram['0.1-0.2'] += 1
+                            elif score < 0.3:
+                                confidence_histogram['0.2-0.3'] += 1
+                            elif score < 0.4:
+                                confidence_histogram['0.3-0.4'] += 1
+                            elif score < 0.5:
+                                confidence_histogram['0.4-0.5'] += 1
+                            elif score < 0.6:
+                                confidence_histogram['0.5-0.6'] += 1
+                            elif score < 0.7:
+                                confidence_histogram['0.6-0.7'] += 1
+                            elif score < 0.8:
+                                confidence_histogram['0.7-0.8'] += 1
+                            elif score < 0.9:
+                                confidence_histogram['0.8-0.9'] += 1
+                            else:
+                                confidence_histogram['0.9-1.0'] += 1
+
+                        print(f"[CONFIDENCE ANALYSIS] {name}")
+                        print(f"  Total proposals: {len(fg_probs)}")
+                        print(f"  Detections at thresholds:")
+                        for thr in [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.85, 0.9]:
+                            n = np.sum(fg_probs >= thr)
+                            pct = 100.0 * n / len(fg_probs)
+                            marker = "👈 CURRENT" if thr == MIN_CONFIDENCE else ""
+                            print(f"    {thr:.2f}: {n:>5} ({pct:>5.1f}%) {marker}")
                 # Детекции
                 det = outs[i_det] if i_det is not None else outs[0]
                 det = _as2d(det)
@@ -6740,7 +6925,10 @@ class MaskRCNN():
 
                 # Денормализация боксов для размерного фильтра
                 pd_boxes_px = _to_pixels(pd_boxes_norm, H, W, D)
-
+                print(f"[BBOX DEBUG] {name}:")
+                for i in range(min(3, len(pd_boxes_px))):
+                    y1, x1, z1, y2, x2, z2 = pd_boxes_px[i]
+                    print(f"  Pred bbox #{i}: Y={y1}-{y2}, X={x1}-{x2}, Z={z1}-{z2}")
                 # === ФИЛЬТР 2: РАЗМЕР (используем MIN_ROI_SIZE в пикселях) ===
                 volumes_px = (pd_boxes_px[:, 3] - pd_boxes_px[:, 0]) * \
                              (pd_boxes_px[:, 4] - pd_boxes_px[:, 1]) * \
@@ -6811,6 +6999,15 @@ class MaskRCNN():
                     gt_boxes, gt_class_ids, gt_masks = self.test_dataset.load_data(image_id)
                     gt_boxes = np.asarray(gt_boxes, dtype=np.int32) if gt_boxes is not None else np.zeros((0, 6),
                                                                                                           np.int32)
+
+                    # ✅ ИСПРАВЛЕНИЕ ПОРЯДКА ОСЕЙ GT ДАННЫХ
+                    if gt_boxes.size > 0:
+                        # (y1,x1,z1,y2,x2,z2) → (y1,z1,x1,y2,z2,x2)
+                        gt_boxes = gt_boxes[:, [0, 2, 1, 3, 5, 4]]
+                        print(f"[GT FIX] Swapped X↔Z in gt_boxes")
+
+
+
                 except:
                     gt_boxes = np.zeros((0, 6), np.int32)
                     gt_masks = None
@@ -6844,7 +7041,22 @@ class MaskRCNN():
                                   f"max={np.max(m_small):.3f}, "
                                   f"min={np.min(m_small):.3f}")
 
+                        # 👇 ДИАГНОСТИКА BBOX 👇
+                        print(f"\n[BBOX COMPARISON] {name}")
+                        print(f"Predicted bbox (normalized):")
+                        for i in range(min(3, len(pd_boxes_norm))):
+                            print(f"  Pred#{i}: {pd_boxes_norm[i]}")
 
+                        print(f"\nGT bbox (normalized):")
+                        if gt_boxes is not None and len(gt_boxes) > 0:
+                            gt_norm = gt_boxes.astype(float)
+                            gt_norm[:, [0, 3]] /= H
+                            gt_norm[:, [1, 4]] /= W
+                            gt_norm[:, [2, 5]] /= D
+                            for i in range(min(3, len(gt_norm))):
+                                print(f"  GT#{i}: {gt_norm[i]}")
+                        else:
+                            print(f"  No GT boxes")
                         full = self.unmold_small_3d_mask(
                             m_small,
                             pd_boxes_px[j],  # ✅ ПРАВИЛЬНО - пиксели!
@@ -6876,6 +7088,7 @@ class MaskRCNN():
 
                 # Вычисляем метрики по МАСКАМ
                 metrics = _compute_mask_metrics(pd_masks, gt_masks, pd_boxes_px, gt_boxes)
+                self._print_metrics_summary(name, metrics)
                 if pd_masks is not None and pd_masks.size > 0:
                     print(f"\n[EVAL] {name}: Masks stats:")
                     print(f"  pd_masks.shape: {pd_masks.shape}")
@@ -6890,6 +7103,17 @@ class MaskRCNN():
                 if gt_masks is not None and gt_masks.size > 0:
                     print(f"  gt_masks.shape: {gt_masks.shape}")
                     print(f"  gt_masks sum: {gt_masks.sum()}")
+                    for g_idx in range(min(gt_masks.shape[-1], 5)):  # Первые 5 масок
+                        gt_coords = np.where(gt_masks[..., g_idx] > 0.5)
+                        if len(gt_coords[0]) > 0:
+                            print(f"  GT mask #{g_idx}: Y={np.min(gt_coords[0])}-{np.max(gt_coords[0])}, "
+                                  f"X={np.min(gt_coords[1])}-{np.max(gt_coords[1])}, "
+                                  f"Z={np.min(gt_coords[2])}-{np.max(gt_coords[2])}, "
+                                  f"pixels={len(gt_coords[0])}")
+                    gt_coords = np.where(gt_masks[..., 0] > 0.5)
+                    print(f"  GT mask #0 Y range: {np.min(gt_coords[0])}-{np.max(gt_coords[0])}")
+                    print(f"  GT mask #0 X range: {np.min(gt_coords[1])}-{np.max(gt_coords[1])}")
+                    print(f"  GT mask #0 Z range: {np.min(gt_coords[2])}-{np.max(gt_coords[2])}")
                 # Визуализация МАСОК (не боксов!)
                 try:
                     _draw_masks_overlay(
@@ -6917,7 +7141,27 @@ class MaskRCNN():
                 print(f"[ERROR] evaluate failed for {image_id}: {e}")
                 import traceback
                 traceback.print_exc()
+        if all_confidence_scores:
+            print(f"\n{'=' * 70}")
+            print(f"[GLOBAL CONFIDENCE STATISTICS]")
+            print(f"{'=' * 70}")
+            print(f"Total proposals: {len(all_confidence_scores)}")
+            print(f"Mean: {np.mean(all_confidence_scores):.4f}")
+            print(f"Median: {np.median(all_confidence_scores):.4f}")
+            print(f"Max: {np.max(all_confidence_scores):.4f}")
 
+            print(f"\n[HISTOGRAM]")
+            total = sum(confidence_histogram.values())
+            for range_name, count in confidence_histogram.items():
+                pct = 100.0 * count / total if total > 0 else 0
+                bar = '█' * int(pct / 2)
+                print(f"  {range_name}: {count:>8} ({pct:>5.1f}%) {bar}")
+
+            p90 = np.percentile(all_confidence_scores, 90)
+            print(f"\n💡 RECOMMENDATION:")
+            print(f"  Current threshold: {MIN_CONFIDENCE}")
+            print(f"  Suggested threshold: {min(0.5, p90):.2f} (90th percentile)")
+            print(f"{'=' * 70}\n")
         # Финальная статистика
         print("\n" + "=" * 70)
         print("EVALUATION SUMMARY (MASK-BASED)")
@@ -7086,7 +7330,13 @@ class MaskRCNN():
             binm_resized[:actual_h, :actual_w, :actual_d]
 
         print(f"  final mask: sum={np.sum(full_mask)}")
-
+        print(f"[UNMOLD_DEBUG] Predicted mask location:")
+        print(f"  Non-zero pixels: {np.sum(full_mask > 0.5)}")  # ✅ full_mask
+        if np.sum(full_mask > 0.5) > 0:  # ✅ full_mask
+            coords = np.where(full_mask > 0.5)  # ✅ full_mask
+            print(f"  Y range: {np.min(coords[0])}-{np.max(coords[0])}")
+            print(f"  X range: {np.min(coords[1])}-{np.max(coords[1])}")
+            print(f"  Z range: {np.min(coords[2])}-{np.max(coords[2])}")
         return full_mask
 
     def unmold_detections(self, detections, mrcnn_mask):
@@ -7160,9 +7410,10 @@ class MaskRCNN():
 
         if full_masks:
             masks_nhwd = np.stack(full_masks, axis=0)
-            seg_union = np.any(masks_nhwd, axis=0)
+            masks_nhwd = np.moveaxis(masks_nhwd, 0, -1)  # теперь (H, W, D, N)
+            seg_union = np.any(masks_nhwd, axis=-1)
         else:
-            masks_nhwd = np.zeros((0, H, W, D), dtype=bool)
+            masks_nhwd = np.zeros((H, W, D, 0), dtype=bool)
             seg_union = np.zeros((H, W, D), dtype=bool)
 
         return boxes_px, scores, class_ids, masks_nhwd, seg_union
